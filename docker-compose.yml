@@ -10,7 +10,7 @@
 
 services:
   newapi-tools:
-    image: ghcr.io/james-6-23/new_api_tools:latest
+    image: ghcr.io/xiao-qiu-qiu/new_api_tools:latest
     container_name: newapi-tools
     ports:
       # FRONTEND_BIND 控制端口绑定的网卡：
@@ -49,6 +49,8 @@ services:
       - LOG_LEVEL=${LOG_LEVEL:-info}
       # NewAPI 连接
       - NEWAPI_BASEURL=${NEWAPI_BASEURL:-}
+      # 主动探测测试令牌（可选，也可在管理端填写；管理端不会回显令牌）
+      - NEWAPI_PROBE_TOKEN=${NEWAPI_PROBE_TOKEN:-}
     volumes:
       - ./data:/app/data
     restart: unless-stopped

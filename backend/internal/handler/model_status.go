@@ -2,6 +2,7 @@ package handler
 
 import (
 	"net/http"
+	"strconv"
 
 	"github.com/gin-gonic/gin"
 	"github.com/new-api-tools/backend/internal/models"
@@ -45,6 +46,10 @@ func RegisterModelStatusRoutes(r *gin.RouterGroup) {
 		g.PUT("/config/site-title", SetSiteTitleConfig)
 		g.POST("/config/site-title", SetSiteTitleConfig)
 		g.GET("/token-groups", GetTokenGroupsForModelStatus)
+		g.GET("/probe/config", GetActiveProbeConfig)
+		g.PUT("/probe/config", SetActiveProbeConfig)
+		g.POST("/probe/run", RunActiveProbe)
+		g.GET("/probe/history", GetActiveProbeHistory)
 	}
 
 }
@@ -64,6 +69,8 @@ func RegisterModelStatusEmbedRoutes(r *gin.Engine) {
 		g.GET("/config", GetEmbedConfig)
 		g.GET("/config/selected", GetSelectedModels)
 		g.GET("/token-groups", GetTokenGroupsForModelStatus)
+		g.GET("/probe/summary", GetActiveProbeSummary)
+		g.GET("/probe/history", GetActiveProbeHistory)
 	}
 
 	// Compat embed path: /api/model-status/embed/... (used by embed.html frontend)
@@ -78,6 +85,8 @@ func RegisterModelStatusEmbedRoutes(r *gin.Engine) {
 		e.GET("/config", GetEmbedConfig)
 		e.GET("/config/selected", GetSelectedModels)
 		e.GET("/token-groups", GetTokenGroupsForModelStatus)
+		e.GET("/probe/summary", GetActiveProbeSummary)
+		e.GET("/probe/history", GetActiveProbeHistory)
 	}
 }
 
@@ -448,4 +457,47 @@ func SetSiteTitleConfig(c *gin.Context) {
 		"site_title": req.SiteTitle,
 		"message":    "Site title updated",
 	})
+}
+
+func GetActiveProbeConfig(c *gin.Context) {
+	data := service.NewActiveProbeService().GetConfigView()
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+}
+
+func SetActiveProbeConfig(c *gin.Context) {
+	var req service.ActiveProbeConfigInput
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "主动探测配置格式不正确", ""))
+		return
+	}
+	data, err := service.NewActiveProbeService().SetConfig(req)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PROBE_CONFIG", err.Error(), ""))
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+}
+
+func RunActiveProbe(c *gin.Context) {
+	data, err := service.NewActiveProbeService().RunNow(c.Request.Context())
+	if err != nil {
+		status := http.StatusBadRequest
+		if err.Error() == "主动探测正在运行" {
+			status = http.StatusConflict
+		}
+		c.JSON(status, models.ErrorResp("PROBE_FAILED", err.Error(), ""))
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+}
+
+func GetActiveProbeHistory(c *gin.Context) {
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "48"))
+	data := service.NewActiveProbeService().GetHistory(c.Query("model"), limit)
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+}
+
+func GetActiveProbeSummary(c *gin.Context) {
+	data := service.NewActiveProbeService().GetSummary()
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
 }

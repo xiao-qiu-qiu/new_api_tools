@@ -15,11 +15,11 @@ func RegisterHealthRoutes(r *gin.Engine) {
 }
 
 // HealthCheck handles GET /api/health
-// Matches Python: {"status": "healthy", "version": "0.1.0"}
+// HealthCheck reports the currently deployed API contract version.
 func HealthCheck(c *gin.Context) {
 	c.JSON(http.StatusOK, models.HealthResponse{
 		Status:  "healthy",
-		Version: "0.1.0",
+		Version: "0.2.0",
 	})
 }
 

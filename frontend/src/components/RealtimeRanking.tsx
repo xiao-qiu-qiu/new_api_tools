@@ -558,7 +558,7 @@ export function RealtimeRanking() {
   // 组件挂载时获取系统规模设置
   useEffect(() => {
     fetchSystemScale()
-  }, [])  // 只在挂载时执行一次
+  }, [fetchSystemScale])
 
   // 保存刷新间隔到 localStorage
   const handleRefreshIntervalChange = useCallback((val: number) => {
@@ -1213,7 +1213,7 @@ export function RealtimeRanking() {
       }
       fetchModelsFromCache()
     }
-  }, [aiConfig?.base_url, aiConfig?.has_api_key, apiUrl, getAuthHeaders])
+  }, [aiConfig?.base_url, aiConfig?.has_api_key, aiModels.length, apiUrl, getAuthHeaders])
 
   const openUserIpsDialog = (userId: number, username: string) => {
     setSelectedUserForIps({ id: userId, username })

@@ -5,7 +5,7 @@ set -euo pipefail
 # NewAPI Middleware Tool - 快速安装脚本
 #
 # 用法:
-#   bash <(curl -sSL https://raw.githubusercontent.com/james-6-23/new_api_tools/main/install.sh)
+#   bash <(curl -sSL https://raw.githubusercontent.com/xiao-qiu-qiu/new_api_tools/main/install.sh)
 #
 # 功能:
 #   1. 自动检测 NewAPI 安装目录
@@ -27,7 +27,7 @@ log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 die() { log_error "$*"; exit 1; }
 
-REPO_URL="https://github.com/james-6-23/new_api_tools.git"
+REPO_URL="https://github.com/xiao-qiu-qiu/new_api_tools.git"
 PROJECT_NAME="new_api_tools"
 REINSTALL=false
 
@@ -74,7 +74,7 @@ cleanup_project_docker_resources() {
     | xargs -r docker rm -f 2>/dev/null || true
 
   docker images --format '{{.Repository}}:{{.Tag}}' \
-    | grep -E '^(ghcr\.io/james-6-23/new_api_tools|new_api_tools|newapi-tools|newapi-tools-backend|newapi-tools-frontend)(:|$)' \
+    | grep -E '^(ghcr\.io/(james-6-23|xiao-qiu-qiu)/new_api_tools|new_api_tools|newapi-tools|newapi-tools-backend|newapi-tools-frontend)(:|$)' \
     | xargs -r docker rmi -f 2>/dev/null || true
 
   docker network rm newapi-tools-network new_api_tools_default 2>/dev/null || true
@@ -879,7 +879,7 @@ do_purge_interactive() {
   echo ""
   echo -e "${YELLOW}将永久删除以下 newapi-tools 自身的数据：${NC}"
   echo "  • 容器: newapi-tools / newapi-tools-redis"
-  echo "  • 镜像: ghcr.io/james-6-23/new_api_tools:*"
+  echo "  • 镜像: ghcr.io/xiao-qiu-qiu/new_api_tools:*"
   echo "  • Redis 缓存卷 (仪表盘 / 模型状态 / 等缓存)"
   echo "  • Docker 网络: newapi-tools-network (若存在)"
   echo "  • 配置文件 .env (含登录密码)"
@@ -1510,7 +1510,7 @@ NewAPI Middleware Tool - 安装管理脚本
   PROJECT_DIR      指定项目目录（默认: 自动检测）
   NEWAPI_CONTAINER 指定 NewAPI 容器名（默认: 自动检测）
 
-更多信息: https://github.com/james-6-23/new_api_tools
+更多信息: https://github.com/xiao-qiu-qiu/new_api_tools
 EOF
 }
 

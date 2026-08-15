@@ -3,7 +3,6 @@ package service
 import (
 	"encoding/json"
 	"fmt"
-	"math"
 	"time"
 
 	"github.com/new-api-tools/backend/internal/cache"
@@ -14,17 +13,27 @@ import (
 var (
 	AvailableTimeWindows = []string{"1h", "6h", "12h", "24h"}
 	DefaultTimeWindow    = "24h"
-	AvailableThemes = []string{
-		"daylight", "obsidian", "minimal", "neon", "forest", "ocean", "terminal",
-		"cupertino", "material", "openai", "anthropic", "vercel", "linear",
-		"stripe", "github", "discord", "tesla",
-	}
-	DefaultTheme = "daylight"
+	AvailableThemes      = []string{"system", "light", "dark"}
+	DefaultTheme         = "system"
 	// LegacyThemeMap maps old theme names to valid ones
 	LegacyThemeMap = map[string]string{
-		"light":  "daylight",
-		"dark":   "obsidian",
-		"system": "daylight",
+		"daylight":  "light",
+		"cupertino": "light",
+		"material":  "light",
+		"openai":    "light",
+		"anthropic": "light",
+		"stripe":    "light",
+		"obsidian":  "dark",
+		"minimal":   "light",
+		"neon":      "dark",
+		"forest":    "dark",
+		"ocean":     "dark",
+		"terminal":  "dark",
+		"vercel":    "dark",
+		"linear":    "dark",
+		"github":    "dark",
+		"discord":   "dark",
+		"tesla":     "dark",
 	}
 	AvailableRefreshIntervals = []int{0, 30, 60, 120, 300}
 	AvailableSortModes        = []string{"default", "availability", "custom"}
@@ -45,22 +54,25 @@ var timeWindowConfigs = map[string]timeWindowConfig{
 	"24h": {86400, 24, 3600}, // 24 hours, 24 slots, 1 hour each
 }
 
-// getStatusColor determines status color based on success rate (matches Python backend)
-func getStatusColor(successRate float64, totalRequests int64) string {
-	if totalRequests == 0 {
-		return "green" // No requests = no issues
-	}
-	if successRate >= 95 {
-		return "green"
-	} else if successRate >= 80 {
-		return "yellow"
-	}
-	return "red"
+// ModelStatusSlot intentionally contains only raw counters. The frontend can
+// derive rates and colors without paying for repeated labels in every slot.
+type ModelStatusSlot struct {
+	Timestamp int64 `json:"t"`
+	Total     int64 `json:"n"`
+	Success   int64 `json:"ok"`
+	Failure   int64 `json:"fail,omitempty"`
+	Empty     int64 `json:"empty,omitempty"`
 }
 
-// roundRate rounds a float to 2 decimal places
-func roundRate(rate float64) float64 {
-	return math.Round(rate*100) / 100
+type ModelStatusSnapshot struct {
+	Model       string            `json:"model"`
+	Window      string            `json:"window"`
+	SlotSeconds int64             `json:"step"`
+	Total       int64             `json:"total"`
+	Success     int64             `json:"ok"`
+	Failure     int64             `json:"fail,omitempty"`
+	Empty       int64             `json:"empty,omitempty"`
+	Slots       []ModelStatusSlot `json:"slots"`
 }
 
 // ModelStatusService handles model availability monitoring
@@ -103,10 +115,10 @@ func (s *ModelStatusService) GetAvailableModels() ([]map[string]interface{}, err
 
 // GetModelStatus returns status for a specific model
 // Uses a single GROUP BY FLOOR query (matches Python backend optimization)
-func (s *ModelStatusService) GetModelStatus(modelName, window string) (map[string]interface{}, error) {
+func (s *ModelStatusService) GetModelStatus(modelName, window string) (ModelStatusSnapshot, error) {
 	cacheKey := fmt.Sprintf("model_status:%s:%s", modelName, window)
 	cm := cache.Get()
-	var cached map[string]interface{}
+	var cached ModelStatusSnapshot
 	found, _ := cm.GetJSON(cacheKey, &cached)
 	if found {
 		return cached, nil
@@ -136,7 +148,7 @@ func (s *ModelStatusService) GetModelStatus(modelName, window string) (map[strin
 			COUNT(*) as total,
 			SUM(CASE WHEN type = 2 AND completion_tokens > 0 THEN 1 ELSE 0 END) as success,
 			SUM(CASE WHEN type = 5 THEN 1 ELSE 0 END) as failure,
-			SUM(CASE WHEN type = 2 AND completion_tokens = 0 THEN 1 ELSE 0 END) as empty
+			SUM(CASE WHEN type = 2 AND completion_tokens = 0 THEN 1 ELSE 0 END) as empty_count
 		FROM logs
 		WHERE model_name = ?
 			AND created_at >= ? AND created_at < ?
@@ -145,7 +157,10 @@ func (s *ModelStatusService) GetModelStatus(modelName, window string) (map[strin
 		startTime, slotSeconds,
 		startTime, slotSeconds))
 
-	rows, _ := s.logDB.Query(slotQuery, modelName, startTime, now)
+	rows, err := s.logDB.Query(slotQuery, modelName, startTime, now)
+	if err != nil {
+		return ModelStatusSnapshot{}, err
+	}
 
 	// Initialize all slots with zeros
 	type slotInfo struct {
@@ -165,14 +180,15 @@ func (s *ModelStatusService) GetModelStatus(modelName, window string) (map[strin
 					total:   toInt64(row["total"]),
 					success: toInt64(row["success"]),
 					failure: toInt64(row["failure"]),
-					empty:   toInt64(row["empty"]),
+					empty:   toInt64(row["empty_count"]),
 				}
 			}
 		}
 	}
 
-	// Build slot_data list with status colors
-	slotData := make([]map[string]interface{}, 0, numSlots)
+	// Keep the wire format compact. Slot end time, rate and visual status are
+	// deterministic frontend concerns and are intentionally not transmitted.
+	slotData := make([]ModelStatusSlot, 0, numSlots)
 	totalReqs := int64(0)
 	totalSuccess := int64(0)
 	totalFailure := int64(0)
@@ -180,8 +196,6 @@ func (s *ModelStatusService) GetModelStatus(modelName, window string) (map[strin
 
 	for i := 0; i < numSlots; i++ {
 		slotStart := startTime + int64(i)*slotSeconds
-		slotEnd := slotStart + slotSeconds
-
 		si := slotMap[int64(i)]
 		slotTotal := int64(0)
 		slotSuccess := int64(0)
@@ -194,21 +208,12 @@ func (s *ModelStatusService) GetModelStatus(modelName, window string) (map[strin
 			slotEmpty = si.empty
 		}
 
-		slotRate := float64(100)
-		if slotTotal > 0 {
-			slotRate = float64(slotSuccess) / float64(slotTotal) * 100
-		}
-
-		slotData = append(slotData, map[string]interface{}{
-			"slot":           i,
-			"start_time":     slotStart,
-			"end_time":       slotEnd,
-			"total_requests": slotTotal,
-			"success_count":  slotSuccess,
-			"failure_count":  slotFailure,
-			"empty_count":    slotEmpty,
-			"success_rate":   roundRate(slotRate),
-			"status":         getStatusColor(slotRate, slotTotal),
+		slotData = append(slotData, ModelStatusSlot{
+			Timestamp: slotStart,
+			Total:     slotTotal,
+			Success:   slotSuccess,
+			Failure:   slotFailure,
+			Empty:     slotEmpty,
 		})
 
 		totalReqs += slotTotal
@@ -217,22 +222,15 @@ func (s *ModelStatusService) GetModelStatus(modelName, window string) (map[strin
 		totalEmpty += slotEmpty
 	}
 
-	overallRate := float64(100)
-	if totalReqs > 0 {
-		overallRate = float64(totalSuccess) / float64(totalReqs) * 100
-	}
-
-	result := map[string]interface{}{
-		"model_name":     modelName,
-		"display_name":   modelName,
-		"time_window":    window,
-		"total_requests": totalReqs,
-		"success_count":  totalSuccess,
-		"failure_count":  totalFailure,
-		"empty_count":    totalEmpty,
-		"success_rate":   roundRate(overallRate),
-		"current_status": getStatusColor(overallRate, totalReqs),
-		"slot_data":      slotData,
+	result := ModelStatusSnapshot{
+		Model:       modelName,
+		Window:      window,
+		SlotSeconds: slotSeconds,
+		Total:       totalReqs,
+		Success:     totalSuccess,
+		Failure:     totalFailure,
+		Empty:       totalEmpty,
+		Slots:       slotData,
 	}
 
 	cm.Set(cacheKey, result, 30*time.Second)
@@ -240,8 +238,8 @@ func (s *ModelStatusService) GetModelStatus(modelName, window string) (map[strin
 }
 
 // GetMultipleModelsStatus returns status for multiple models
-func (s *ModelStatusService) GetMultipleModelsStatus(modelNames []string, window string) ([]map[string]interface{}, error) {
-	results := make([]map[string]interface{}, 0, len(modelNames))
+func (s *ModelStatusService) GetMultipleModelsStatus(modelNames []string, window string) ([]ModelStatusSnapshot, error) {
+	results := make([]ModelStatusSnapshot, 0, len(modelNames))
 	for _, name := range modelNames {
 		status, err := s.GetModelStatus(name, window)
 		if err != nil {
@@ -253,7 +251,7 @@ func (s *ModelStatusService) GetMultipleModelsStatus(modelNames []string, window
 }
 
 // GetAllModelsStatus returns status for all models that have requests
-func (s *ModelStatusService) GetAllModelsStatus(window string) ([]map[string]interface{}, error) {
+func (s *ModelStatusService) GetAllModelsStatus(window string) ([]ModelStatusSnapshot, error) {
 	models, err := s.GetAvailableModels()
 	if err != nil {
 		return nil, err

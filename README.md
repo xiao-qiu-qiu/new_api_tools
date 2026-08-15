@@ -32,7 +32,7 @@
 | 前端栈 | React `19`、Vite `8`、TypeScript、Tailwind CSS、ECharts |
 | 数据库 | 生产优先 PostgreSQL / MySQL，查询字段以导出的真实 schema 为准 |
 | 部署入口 | `install.sh` 一键部署，或 `docker-compose.yml` 手动部署 |
-| 镜像 | `ghcr.io/james-6-23/new_api_tools:latest` |
+| 镜像 | `ghcr.io/xiao-qiu-qiu/new_api_tools:latest` |
 
 ## 能力速览
 
@@ -44,7 +44,7 @@
 | 风控中心 | 查看高频请求、额度消耗、关联账号、同 IP 注册、Token 轮换、封禁记录和用户风险画像。 |
 | 联合违规广播 | 接入独立 `newapi-tool-AbuseHub`，同步外部通报，本地匹配 email / OAuth / LinuxDo / IP 等身份线索，由管理员人工复核。 |
 | IP 与日志分析 | 对大表 `logs` 做缓存化统计，提供 IP 分布、共享 IP、用户请求排行、模型使用和同步状态。 |
-| 模型监控 | 配置模型状态看板、时间窗口、展示主题、刷新间隔、分组和可公开嵌入的模型状态页。 |
+| 模型监控 | 同时展示用户流量健康度和独立主动探测；公开状态页可直接嵌入，无需颜色参数。 |
 | 用户与令牌运维 | 用户列表、封禁/解封、软删除清理、令牌统计、分组预览和自动分组任务。 |
 
 ## 架构边界
@@ -62,7 +62,7 @@
 如果 NewAPI 已部署在 Linux 服务器上，可以使用一键脚本自动检测环境并部署：
 
 ```bash
-bash <(curl -sSL https://raw.githubusercontent.com/james-6-23/new_api_tools/main/install.sh)
+bash <(curl -sSL https://raw.githubusercontent.com/xiao-qiu-qiu/new_api_tools/main/install.sh)
 ```
 
 脚本会自动定位 NewAPI 安装目录、读取数据库配置、生成必要密钥、设置管理员密码、配置 Docker 网络并启动服务。部署完成后访问：
@@ -76,7 +76,7 @@ http://your-server-ip:1145
 适用于熟悉 Docker 的用户或非标准环境：
 
 ```bash
-git clone https://github.com/james-6-23/new_api_tools.git
+git clone https://github.com/xiao-qiu-qiu/new_api_tools.git
 cd new_api_tools
 cp .env.example .env
 vim .env
@@ -91,13 +91,13 @@ docker-compose up -d
 
 ```bash
 # 一键脚本已涵盖日志库；重新运行即可让已部署实例补上日志库连接
-bash <(curl -sSL https://raw.githubusercontent.com/james-6-23/new_api_tools/main/install.sh)
+bash <(curl -sSL https://raw.githubusercontent.com/xiao-qiu-qiu/new_api_tools/main/install.sh)
 ```
 
 > 单独修复 / 不想整体重部署时，也可只跑日志库脚本：
 > ```bash
-> bash <(curl -sSL https://raw.githubusercontent.com/james-6-23/new_api_tools/main/setup-log-db.sh)         # 检测并配置
-> bash <(curl -sSL https://raw.githubusercontent.com/james-6-23/new_api_tools/main/setup-log-db.sh) --print # 仅预览，不改动
+> bash <(curl -sSL https://raw.githubusercontent.com/xiao-qiu-qiu/new_api_tools/main/setup-log-db.sh)         # 检测并配置
+> bash <(curl -sSL https://raw.githubusercontent.com/xiao-qiu-qiu/new_api_tools/main/setup-log-db.sh) --print # 仅预览，不改动
 > ```
 > 即使日志库一时连不上，后端也只会**降级为读主库**（日志暂时为空），不会崩溃。
 
@@ -125,11 +125,23 @@ bash <(curl -sSL https://raw.githubusercontent.com/james-6-23/new_api_tools/main
 | `DB_MAX_IDLE_CONNS` | 数据库最大空闲连接数 | `15` |
 | `NEWAPI_NETWORK` | NewAPI 所在 Docker 网络 | `new-api_default` |
 | `NEWAPI_BASEURL` | NewAPI 内部地址，用于需要回调上游的功能 | 可选 |
+| `NEWAPI_PROBE_TOKEN` | 主动探测使用的最小权限测试令牌；管理端设置后不会回显 | 可选 |
 | `REDIS_PASSWORD` | 内置 Redis 密码 | 留空或自定义 |
 | `TIMEZONE` | 服务时区 | `Asia/Shanghai` |
 | `LOG_LEVEL` | 日志级别 | `info` |
 | `DOWNLOAD_GEOIP` | 部署脚本是否下载 GeoIP（IP 定位用，约 70MB；可选，默认交互询问且默认跳过） | `0` 跳过 / `1` 下载 |
 | `SKIP_GEOIP_DOWNLOAD` | 设为 `1` 时强制跳过 GeoIP 下载 | 可选 |
+
+## 模型状态与主动探测
+
+模型状态页明确区分两类信号：
+
+- **用户流量健康度**：读取 NewAPI `logs` 表，按请求数、成功数、空响应和失败数聚合。API 只返回紧凑原始计数，成功率、状态和颜色由前端计算；没有请求时显示“无数据”，不会显示为绿色。
+- **主动探测**：定时调用 NewAPI 的 `GET /v1/models`，再对配置的模型发送最小 `POST /v1/chat/completions` 请求。此功能默认关闭，可在「模型状态 → 主动探测」中配置并立即执行。
+
+建议为探测单独创建低额度测试令牌。令牌保存在内部 Redis 配置中，管理接口只返回 `has_token`，不会回传令牌；日志与探测历史也不保存请求体或上游响应体。
+
+公开状态页为 `/embed.html`。主题、模型和刷新间隔读取管理端保存的配置，不需要 URL 颜色参数。页面可直接通过 iframe 嵌入，容器内 Nginx 仅对这个公开入口放开 `frame-ancestors`。
 
 ## 联合违规广播接入
 
@@ -174,7 +186,7 @@ npm run dev
 | 兑换码 | `GET /api/redemptions`、`POST /api/redemptions/generate` |
 | 风控 | `GET /api/risk/*`、`GET /api/ip/*`、`POST /api/ai-ban/*` |
 | 联合广播 | `GET /api/abuse-broadcast/*`、`POST /api/abuse-broadcast/*` |
-| 模型状态 | `GET /api/model-status/*`、`GET /api/embed/model-status/*` |
+| 模型状态 | `GET /api/model-status/*`、`PUT /api/model-status/probe/config`、`POST /api/model-status/probe/run`、`GET /api/model-status/embed/*` |
 | 用户与令牌 | `GET /api/users`、`GET /api/tokens`、`GET /api/auto-group/*` |
 | 存储与系统 | `GET /api/storage/*`、`GET /api/system/*` |
 
@@ -198,4 +210,4 @@ MIT License
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=james-6-23/new_api_tools&type=Date)](https://star-history.com/#james-6-23/new_api_tools&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=xiao-qiu-qiu/new_api_tools&type=Date)](https://star-history.com/#xiao-qiu-qiu/new_api_tools&Date)

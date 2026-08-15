@@ -123,6 +123,9 @@ func main() {
 	stopAbuseBroadcast := make(chan struct{})
 	go backgroundSyncAbuseBroadcast(stopAbuseBroadcast)
 
+	stopActiveProbe := make(chan struct{})
+	go service.RunActiveProbeScheduler(stopActiveProbe)
+
 	// ========== 8. Start server with graceful shutdown ==========
 	srv := &http.Server{
 		Addr:         cfg.ServerAddr(),
@@ -150,6 +153,7 @@ func main() {
 	// Stop background tasks
 	close(stopIPEnforce)
 	close(stopAbuseBroadcast)
+	close(stopActiveProbe)
 
 	// Give the server 10 seconds to finish processing requests
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
