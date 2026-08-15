@@ -58,6 +58,44 @@
     --sidebar-border: 240 4% 24%;
   }
 
+  html[data-status-theme="daylight"] {
+    --background: 210 40% 98%;
+    --foreground: 222 47% 11%;
+    --card: 0 0% 100%;
+    --card-foreground: 222 47% 11%;
+    --muted: 210 40% 96%;
+    --muted-foreground: 215 16% 47%;
+    --accent: 199 89% 94%;
+    --accent-foreground: 199 89% 32%;
+    --border: 214 32% 88%;
+    --input: 214 32% 88%;
+    --primary: 199 89% 48%;
+    --sidebar: 210 40% 96%;
+    --sidebar-foreground: 222 47% 11%;
+    --sidebar-accent: 199 89% 91%;
+    --sidebar-accent-foreground: 199 89% 28%;
+    --sidebar-border: 214 32% 88%;
+  }
+
+  html.dark[data-status-theme="obsidian"] {
+    --background: 222 47% 8%;
+    --foreground: 210 40% 96%;
+    --card: 222 38% 12%;
+    --card-foreground: 210 40% 96%;
+    --muted: 222 32% 16%;
+    --muted-foreground: 215 20% 65%;
+    --accent: 199 55% 20%;
+    --accent-foreground: 199 89% 78%;
+    --border: 217 33% 22%;
+    --input: 217 33% 25%;
+    --primary: 199 89% 55%;
+    --sidebar: 222 47% 6%;
+    --sidebar-foreground: 210 40% 96%;
+    --sidebar-accent: 199 55% 19%;
+    --sidebar-accent-foreground: 199 89% 78%;
+    --sidebar-border: 217 33% 18%;
+  }
+
   * {
     @apply border-border;
     letter-spacing: 0;

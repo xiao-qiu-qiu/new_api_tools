@@ -3,6 +3,8 @@ package service
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,12 +30,20 @@ const (
 )
 
 type ActiveProbeConfig struct {
-	Enabled         bool     `json:"enabled"`
-	BaseURL         string   `json:"base_url"`
-	Models          []string `json:"models"`
-	IntervalSeconds int      `json:"interval_seconds"`
-	TimeoutSeconds  int      `json:"timeout_seconds"`
-	Token           string   `json:"token"`
+	Enabled         bool               `json:"enabled"`
+	BaseURL         string             `json:"base_url"`
+	Models          []string           `json:"models"`
+	IntervalSeconds int                `json:"interval_seconds"`
+	TimeoutSeconds  int                `json:"timeout_seconds"`
+	ProbeMode       string             `json:"probe_mode"`
+	Tokens          []activeProbeToken `json:"tokens"`
+	Token           string             `json:"token,omitempty"` // legacy single-token storage
+}
+
+type activeProbeToken struct {
+	ID    string `json:"id"`
+	Label string `json:"label"`
+	Token string `json:"token"`
 }
 
 type ActiveProbeConfigInput struct {
@@ -42,36 +52,95 @@ type ActiveProbeConfigInput struct {
 	Models          []string `json:"models"`
 	IntervalSeconds int      `json:"interval_seconds"`
 	TimeoutSeconds  int      `json:"timeout_seconds"`
+	ProbeMode       string   `json:"probe_mode"`
 	Token           string   `json:"token"`
 	ClearToken      bool     `json:"clear_token"`
 }
 
 type ActiveProbeConfigView struct {
-	Enabled         bool     `json:"enabled"`
-	BaseURL         string   `json:"base_url"`
-	Models          []string `json:"models"`
-	IntervalSeconds int      `json:"interval_seconds"`
-	TimeoutSeconds  int      `json:"timeout_seconds"`
-	HasToken        bool     `json:"has_token"`
+	Enabled         bool                   `json:"enabled"`
+	BaseURL         string                 `json:"base_url"`
+	Models          []string               `json:"models"`
+	IntervalSeconds int                    `json:"interval_seconds"`
+	TimeoutSeconds  int                    `json:"timeout_seconds"`
+	ProbeMode       string                 `json:"probe_mode"`
+	Tokens          []ActiveProbeTokenView `json:"tokens"`
+	TokenCount      int                    `json:"token_count"`
+	HasToken        bool                   `json:"has_token"`
+}
+
+type ActiveProbeTokenView struct {
+	ID       string `json:"id"`
+	Label    string `json:"label"`
+	HasToken bool   `json:"has_token"`
 }
 
 // ActiveProbeResult contains only bounded metadata. Upstream response bodies
 // and credentials are never persisted or returned.
 type ActiveProbeResult struct {
-	Model      string `json:"model"`
-	CheckedAt  int64  `json:"checked_at"`
-	LatencyMS  int64  `json:"latency_ms"`
-	ModelsOK   bool   `json:"models_ok"`
-	ChatOK     bool   `json:"chat_ok"`
-	HTTPStatus int    `json:"http_status,omitempty"`
-	ErrorCode  string `json:"error_code,omitempty"`
+	Model       string `json:"m"`
+	CheckedAt   int64  `json:"t"`
+	LatencyMS   int64  `json:"l,omitempty"`
+	ModelsOK    bool   `json:"mo,omitempty"`
+	ChatChecked bool   `json:"cc,omitempty"`
+	ChatOK      bool   `json:"co,omitempty"`
+	HTTPStatus  int    `json:"s,omitempty"`
+	ErrorCode   string `json:"e,omitempty"`
+}
+
+func (r *ActiveProbeResult) UnmarshalJSON(data []byte) error {
+	type compactResult ActiveProbeResult
+	if err := json.Unmarshal(data, (*compactResult)(r)); err != nil {
+		return err
+	}
+
+	var legacy struct {
+		Model       string `json:"model"`
+		CheckedAt   int64  `json:"checked_at"`
+		LatencyMS   int64  `json:"latency_ms"`
+		ModelsOK    *bool  `json:"models_ok"`
+		ChatChecked *bool  `json:"chat_checked"`
+		ChatOK      *bool  `json:"chat_ok"`
+		HTTPStatus  int    `json:"http_status"`
+		ErrorCode   string `json:"error_code"`
+	}
+	if err := json.Unmarshal(data, &legacy); err != nil {
+		return err
+	}
+	if legacy.Model != "" {
+		r.Model = legacy.Model
+	}
+	if legacy.CheckedAt != 0 {
+		r.CheckedAt = legacy.CheckedAt
+	}
+	if legacy.LatencyMS != 0 {
+		r.LatencyMS = legacy.LatencyMS
+	}
+	if legacy.ModelsOK != nil {
+		r.ModelsOK = *legacy.ModelsOK
+	}
+	if legacy.ChatChecked != nil {
+		r.ChatChecked = *legacy.ChatChecked
+	} else if legacy.ChatOK != nil {
+		r.ChatChecked = true
+	}
+	if legacy.ChatOK != nil {
+		r.ChatOK = *legacy.ChatOK
+	}
+	if legacy.HTTPStatus != 0 {
+		r.HTTPStatus = legacy.HTTPStatus
+	}
+	if legacy.ErrorCode != "" {
+		r.ErrorCode = legacy.ErrorCode
+	}
+	return nil
 }
 
 type ActiveProbeSummary struct {
-	Enabled   bool                `json:"enabled"`
-	Running   bool                `json:"running"`
-	LastRunAt int64               `json:"last_run_at,omitempty"`
-	Results   []ActiveProbeResult `json:"results"`
+	Enabled   bool                `json:"on"`
+	Running   bool                `json:"run"`
+	LastRunAt int64               `json:"t,omitempty"`
+	Results   []ActiveProbeResult `json:"r"`
 }
 
 type ActiveProbeService struct {
@@ -92,8 +161,17 @@ func defaultActiveProbeConfig() ActiveProbeConfig {
 		Models:          []string{},
 		IntervalSeconds: 300,
 		TimeoutSeconds:  20,
-		Token:           strings.TrimSpace(os.Getenv("NEWAPI_PROBE_TOKEN")),
+		ProbeMode:       "chat",
+		Tokens:          envProbeTokens(),
 	}
+}
+
+func envProbeTokens() []activeProbeToken {
+	raw := strings.TrimSpace(os.Getenv("NEWAPI_PROBE_TOKEN"))
+	if raw == "" {
+		return nil
+	}
+	return []activeProbeToken{{ID: "env-1", Label: "环境变量令牌", Token: raw}}
 }
 
 func (s *ActiveProbeService) GetConfig() ActiveProbeConfig {
@@ -111,18 +189,28 @@ func (s *ActiveProbeService) GetConfigView() ActiveProbeConfigView {
 }
 
 func activeProbeConfigView(cfg ActiveProbeConfig) ActiveProbeConfigView {
+	tokens := make([]ActiveProbeTokenView, 0, len(cfg.Tokens))
+	for _, token := range cfg.Tokens {
+		tokens = append(tokens, ActiveProbeTokenView{ID: token.ID, Label: token.Label, HasToken: token.Token != ""})
+	}
 	return ActiveProbeConfigView{
 		Enabled:         cfg.Enabled,
 		BaseURL:         cfg.BaseURL,
 		Models:          append([]string(nil), cfg.Models...),
 		IntervalSeconds: cfg.IntervalSeconds,
 		TimeoutSeconds:  cfg.TimeoutSeconds,
-		HasToken:        cfg.Token != "",
+		ProbeMode:       cfg.ProbeMode,
+		Tokens:          tokens,
+		TokenCount:      len(tokens),
+		HasToken:        len(tokens) > 0,
 	}
 }
 
 func normalizeActiveProbeConfig(cfg *ActiveProbeConfig) {
 	cfg.BaseURL = strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
+	if cfg.ProbeMode != "models" && cfg.ProbeMode != "chat" {
+		cfg.ProbeMode = "chat"
+	}
 	if cfg.IntervalSeconds < 30 {
 		cfg.IntervalSeconds = 30
 	}
@@ -150,6 +238,31 @@ func normalizeActiveProbeConfig(cfg *ActiveProbeConfig) {
 		models = append(models, model)
 	}
 	cfg.Models = models
+
+	if strings.TrimSpace(cfg.Token) != "" {
+		cfg.Tokens = append(cfg.Tokens, activeProbeToken{ID: "legacy-1", Label: "旧版令牌", Token: strings.TrimSpace(cfg.Token)})
+		cfg.Token = ""
+	}
+	seenTokens := make(map[string]struct{}, len(cfg.Tokens))
+	tokens := make([]activeProbeToken, 0, len(cfg.Tokens))
+	for index, token := range cfg.Tokens {
+		token.Token = strings.TrimSpace(token.Token)
+		if token.Token == "" {
+			continue
+		}
+		if _, exists := seenTokens[token.Token]; exists {
+			continue
+		}
+		seenTokens[token.Token] = struct{}{}
+		if token.ID == "" {
+			token.ID = fmt.Sprintf("probe-%d", index+1)
+		}
+		if strings.TrimSpace(token.Label) == "" {
+			token.Label = fmt.Sprintf("令牌 %d", index+1)
+		}
+		tokens = append(tokens, token)
+	}
+	cfg.Tokens = tokens
 }
 
 func validateProbeBaseURL(raw string) error {
@@ -171,12 +284,13 @@ func (s *ActiveProbeService) SetConfig(input ActiveProbeConfigInput) (ActiveProb
 		Models:          input.Models,
 		IntervalSeconds: input.IntervalSeconds,
 		TimeoutSeconds:  input.TimeoutSeconds,
-		Token:           current.Token,
+		ProbeMode:       input.ProbeMode,
+		Tokens:          current.Tokens,
 	}
 	if input.ClearToken {
-		next.Token = ""
+		next.Tokens = nil
 	} else if strings.TrimSpace(input.Token) != "" {
-		next.Token = strings.TrimSpace(input.Token)
+		next.Tokens = append(next.Tokens, activeProbeToken{ID: "legacy-" + fmt.Sprint(time.Now().UnixNano()), Label: "新增令牌", Token: strings.TrimSpace(input.Token)})
 	}
 	normalizeActiveProbeConfig(&next)
 	if next.BaseURL != "" {
@@ -188,7 +302,7 @@ func (s *ActiveProbeService) SetConfig(input ActiveProbeConfigInput) (ActiveProb
 		if next.BaseURL == "" {
 			return ActiveProbeConfigView{}, errors.New("开启主动探测前请填写 NEWAPI 地址")
 		}
-		if next.Token == "" {
+		if len(next.Tokens) == 0 {
 			return ActiveProbeConfigView{}, errors.New("开启主动探测前请填写测试令牌")
 		}
 		if len(next.Models) == 0 {
@@ -199,6 +313,91 @@ func (s *ActiveProbeService) SetConfig(input ActiveProbeConfigInput) (ActiveProb
 		return ActiveProbeConfigView{}, err
 	}
 	return activeProbeConfigView(next), nil
+}
+
+func newProbeTokenID() string {
+	bytes := make([]byte, 8)
+	if _, err := rand.Read(bytes); err == nil {
+		return "probe-" + hex.EncodeToString(bytes)
+	}
+	return fmt.Sprintf("probe-%d", time.Now().UnixNano())
+}
+
+func (s *ActiveProbeService) AddToken(raw, label string) (ActiveProbeConfigView, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ActiveProbeConfigView{}, errors.New("测试令牌不能为空")
+	}
+	cfg := s.GetConfig()
+	for _, token := range cfg.Tokens {
+		if token.Token == raw {
+			return activeProbeConfigView(cfg), nil
+		}
+	}
+	cfg.Tokens = append(cfg.Tokens, activeProbeToken{ID: newProbeTokenID(), Label: strings.TrimSpace(label), Token: raw})
+	normalizeActiveProbeConfig(&cfg)
+	if err := cache.Get().Set(probeConfigKey, cfg, 0); err != nil {
+		return ActiveProbeConfigView{}, err
+	}
+	return activeProbeConfigView(cfg), nil
+}
+
+func (s *ActiveProbeService) DeleteToken(id string) (ActiveProbeConfigView, error) {
+	cfg := s.GetConfig()
+	filtered := make([]activeProbeToken, 0, len(cfg.Tokens))
+	found := false
+	for _, token := range cfg.Tokens {
+		if token.ID == id {
+			found = true
+			continue
+		}
+		filtered = append(filtered, token)
+	}
+	if !found {
+		return ActiveProbeConfigView{}, errors.New("测试令牌不存在")
+	}
+	cfg.Tokens = filtered
+	if err := cache.Get().Set(probeConfigKey, cfg, 0); err != nil {
+		return ActiveProbeConfigView{}, err
+	}
+	return activeProbeConfigView(cfg), nil
+}
+
+func (s *ActiveProbeService) FetchModels(ctx context.Context, baseURL, token string) ([]string, error) {
+	cfg := s.GetConfig()
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if baseURL == "" {
+		baseURL = cfg.BaseURL
+	}
+	token = strings.TrimSpace(token)
+	if err := validateProbeBaseURL(baseURL); err != nil {
+		return nil, err
+	}
+	if token == "" {
+		return nil, errors.New("请填写测试令牌")
+	}
+	client := &http.Client{Timeout: time.Duration(cfg.TimeoutSeconds) * time.Second}
+	ok, status, errorCode, models := checkModelsEndpoint(ctx, client, baseURL, token)
+	if !ok {
+		if status > 0 {
+			return nil, fmt.Errorf("读取模型列表失败（HTTP %d）", status)
+		}
+		return nil, fmt.Errorf("读取模型列表失败（%s）", errorCode)
+	}
+	return models, nil
+}
+
+func (s *ActiveProbeService) FetchModelsByTokenID(ctx context.Context, baseURL, tokenID string) ([]string, error) {
+	tokenID = strings.TrimSpace(tokenID)
+	if tokenID == "" {
+		return nil, errors.New("测试令牌不存在")
+	}
+	for _, token := range s.GetConfig().Tokens {
+		if token.ID == tokenID {
+			return s.FetchModels(ctx, baseURL, token.Token)
+		}
+	}
+	return nil, errors.New("测试令牌不存在")
 }
 
 func (s *ActiveProbeService) IsRunning() bool {
@@ -224,7 +423,7 @@ func (s *ActiveProbeService) RunNow(ctx context.Context) ([]ActiveProbeResult, e
 	defer s.setRunning(false)
 
 	cfg := s.GetConfig()
-	if cfg.BaseURL == "" || cfg.Token == "" {
+	if cfg.BaseURL == "" || len(cfg.Tokens) == 0 {
 		return nil, errors.New("主动探测地址或测试令牌未配置")
 	}
 	if len(cfg.Models) == 0 {
@@ -232,18 +431,32 @@ func (s *ActiveProbeService) RunNow(ctx context.Context) ([]ActiveProbeResult, e
 	}
 
 	client := &http.Client{Timeout: time.Duration(cfg.TimeoutSeconds) * time.Second}
-	modelsOK, modelsStatus, modelsError := checkModelsEndpoint(ctx, client, cfg)
+	tokenStates := make([]probeTokenState, 0, len(cfg.Tokens))
+	for _, token := range cfg.Tokens {
+		modelsOK, modelsStatus, modelsError, available := checkModelsEndpoint(ctx, client, cfg.BaseURL, token.Token)
+		tokenStates = append(tokenStates, probeTokenState{
+			token: token, modelsOK: modelsOK, status: modelsStatus, errorCode: modelsError,
+			models: modelSet(available),
+		})
+	}
+	anyModelsOK := false
+	for _, state := range tokenStates {
+		if state.modelsOK {
+			anyModelsOK = true
+			break
+		}
+	}
 	results := make([]ActiveProbeResult, len(cfg.Models))
-	if !modelsOK {
+	if !anyModelsOK {
 		now := time.Now().Unix()
 		for i, model := range cfg.Models {
 			results[i] = ActiveProbeResult{
-				Model:      model,
-				CheckedAt:  now,
-				ModelsOK:   false,
-				ChatOK:     false,
-				HTTPStatus: modelsStatus,
-				ErrorCode:  modelsError,
+				Model:       model,
+				CheckedAt:   now,
+				ModelsOK:    false,
+				ChatChecked: false,
+				HTTPStatus:  firstTokenStatus(tokenStates),
+				ErrorCode:   firstTokenError(tokenStates),
 			}
 		}
 		if err := s.appendHistory(results); err != nil {
@@ -262,13 +475,39 @@ func (s *ActiveProbeService) RunNow(ctx context.Context) ([]ActiveProbeResult, e
 			case sem <- struct{}{}:
 				defer func() { <-sem }()
 			case <-ctx.Done():
-				results[index] = ActiveProbeResult{
-					Model: modelName, CheckedAt: time.Now().Unix(), ModelsOK: true,
-					ErrorCode: "cancelled",
-				}
+				results[index] = ActiveProbeResult{Model: modelName, CheckedAt: time.Now().Unix(), ErrorCode: "cancelled"}
 				return
 			}
-			results[index] = checkChatEndpoint(ctx, client, cfg, modelName)
+
+			candidates := candidateTokenStates(tokenStates, modelName)
+			result := ActiveProbeResult{
+				Model: modelName, CheckedAt: time.Now().Unix(),
+				ModelsOK: len(candidates) > 0,
+			}
+			if len(candidates) == 0 {
+				result.ErrorCode = "model_unavailable"
+				results[index] = result
+				return
+			}
+			if cfg.ProbeMode == "models" {
+				result.HTTPStatus = candidates[0].status
+				results[index] = result
+				return
+			}
+
+			result.ChatChecked = true
+			for _, candidate := range candidates {
+				chatResult := checkChatEndpoint(ctx, client, cfg, modelName, candidate.token.Token)
+				result.LatencyMS += chatResult.LatencyMS
+				result.HTTPStatus = chatResult.HTTPStatus
+				result.ErrorCode = chatResult.ErrorCode
+				if chatResult.ChatOK {
+					result.ChatOK = true
+					result.ErrorCode = ""
+					break
+				}
+			}
+			results[index] = result
 		}(i, model)
 	}
 	wg.Wait()
@@ -278,30 +517,97 @@ func (s *ActiveProbeService) RunNow(ctx context.Context) ([]ActiveProbeResult, e
 	return results, nil
 }
 
-func checkModelsEndpoint(ctx context.Context, client *http.Client, cfg ActiveProbeConfig) (bool, int, string) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cfg.BaseURL+"/v1/models", nil)
-	if err != nil {
-		return false, 0, "models_request"
-	}
-	req.Header.Set("Authorization", "Bearer "+cfg.Token)
-	resp, err := client.Do(req)
-	if err != nil {
-		return false, 0, classifyProbeError(err, "models_network")
-	}
-	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return false, resp.StatusCode, "models_http"
-	}
-	return true, resp.StatusCode, ""
+type probeTokenState struct {
+	token     activeProbeToken
+	modelsOK  bool
+	status    int
+	errorCode string
+	models    map[string]struct{}
 }
 
-func checkChatEndpoint(ctx context.Context, client *http.Client, cfg ActiveProbeConfig, model string) ActiveProbeResult {
-	result := ActiveProbeResult{Model: model, CheckedAt: time.Now().Unix(), ModelsOK: true}
+func modelSet(models []string) map[string]struct{} {
+	set := make(map[string]struct{}, len(models))
+	for _, model := range models {
+		if model != "" {
+			set[model] = struct{}{}
+		}
+	}
+	return set
+}
+
+func candidateTokenStates(states []probeTokenState, model string) []probeTokenState {
+	withModel := make([]probeTokenState, 0, len(states))
+	for _, state := range states {
+		if !state.modelsOK {
+			continue
+		}
+		if _, ok := state.models[model]; ok {
+			withModel = append(withModel, state)
+		}
+	}
+	return withModel
+}
+
+func firstTokenStatus(states []probeTokenState) int {
+	for _, state := range states {
+		if state.status != 0 {
+			return state.status
+		}
+	}
+	return 0
+}
+
+func firstTokenError(states []probeTokenState) string {
+	for _, state := range states {
+		if state.errorCode != "" {
+			return state.errorCode
+		}
+	}
+	return "models_network"
+}
+
+func checkModelsEndpoint(ctx context.Context, client *http.Client, baseURL, token string) (bool, int, string, []string) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(baseURL, "/")+"/v1/models", nil)
+	if err != nil {
+		return false, 0, "models_request", nil
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := client.Do(req)
+	if err != nil {
+		return false, 0, classifyProbeError(err, "models_network"), nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+		return false, resp.StatusCode, "models_http", nil
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if err != nil {
+		return false, resp.StatusCode, "models_body", nil
+	}
+	var payload struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return false, resp.StatusCode, "models_decode", nil
+	}
+	models := make([]string, 0, len(payload.Data))
+	for _, item := range payload.Data {
+		if item.ID != "" {
+			models = append(models, item.ID)
+		}
+	}
+	return true, resp.StatusCode, "", models
+}
+
+func checkChatEndpoint(ctx context.Context, client *http.Client, cfg ActiveProbeConfig, model, token string) ActiveProbeResult {
+	result := ActiveProbeResult{Model: model, CheckedAt: time.Now().Unix(), ModelsOK: true, ChatChecked: true}
 	started := time.Now()
-	status, errorCode := sendChatProbe(ctx, client, cfg, model, "max_tokens")
+	status, errorCode := sendChatProbe(ctx, client, cfg, model, token, "max_tokens")
 	if errorCode == "" && status == http.StatusBadRequest {
-		status, errorCode = sendChatProbe(ctx, client, cfg, model, "max_completion_tokens")
+		status, errorCode = sendChatProbe(ctx, client, cfg, model, token, "max_completion_tokens")
 	}
 	result.LatencyMS = time.Since(started).Milliseconds()
 	if errorCode != "" {
@@ -316,7 +622,7 @@ func checkChatEndpoint(ctx context.Context, client *http.Client, cfg ActiveProbe
 	return result
 }
 
-func sendChatProbe(ctx context.Context, client *http.Client, cfg ActiveProbeConfig, model, tokenField string) (int, string) {
+func sendChatProbe(ctx context.Context, client *http.Client, cfg ActiveProbeConfig, model, token, tokenField string) (int, string) {
 	payload := map[string]interface{}{
 		"model":    model,
 		"messages": []map[string]string{{"role": "user", "content": "ping"}},
@@ -327,11 +633,11 @@ func sendChatProbe(ctx context.Context, client *http.Client, cfg ActiveProbeConf
 	if err != nil {
 		return 0, "chat_payload"
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.BaseURL+"/v1/chat/completions", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(cfg.BaseURL, "/")+"/v1/chat/completions", bytes.NewReader(body))
 	if err != nil {
 		return 0, "chat_request"
 	}
-	req.Header.Set("Authorization", "Bearer "+cfg.Token)
+	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := client.Do(req)
 	if err != nil {
@@ -445,7 +751,7 @@ func RunActiveProbeScheduler(stop <-chan struct{}) {
 			}
 			passed := 0
 			for _, result := range results {
-				if result.ModelsOK && result.ChatOK {
+				if result.ModelsOK && (!result.ChatChecked || result.ChatOK) {
 					passed++
 				}
 			}
@@ -459,7 +765,12 @@ func RunActiveProbeScheduler(stop <-chan struct{}) {
 
 func activeProbeRunTimeout(cfg ActiveProbeConfig) time.Duration {
 	batches := (len(cfg.Models) + probeConcurrency - 1) / probeConcurrency
-	// Include /v1/models and both possible chat parameter attempts per batch.
-	requestWindows := 1 + 2*batches
+	tokens := len(cfg.Tokens)
+	if tokens < 1 {
+		tokens = 1
+	}
+	// Include one model-list request per token and both possible chat parameter
+	// attempts for each model/token fallback batch.
+	requestWindows := tokens + 2*batches*tokens
 	return time.Duration(requestWindows*cfg.TimeoutSeconds)*time.Second + probeShutdownPadding
 }

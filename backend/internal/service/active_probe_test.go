@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -103,7 +104,7 @@ func TestActiveProbeRetriesWithMaxCompletionTokens(t *testing.T) {
 	result := checkChatEndpoint(context.Background(), server.Client(), ActiveProbeConfig{
 		BaseURL: server.URL,
 		Token:   "test-secret",
-	}, "reasoning-model")
+	}, "reasoning-model", "test-secret")
 	if !result.ChatOK || result.HTTPStatus != http.StatusOK {
 		t.Fatalf("unexpected fallback result: %+v", result)
 	}
@@ -120,5 +121,116 @@ func TestActiveProbeRunTimeoutAccountsForConcurrencyBatches(t *testing.T) {
 	cfg.Models = append(cfg.Models, "e")
 	if got, want := activeProbeRunTimeout(cfg), 110*time.Second; got != want {
 		t.Fatalf("five models: got %s, want %s", got, want)
+	}
+}
+
+func TestActiveProbeUsesTokenModelVisibilityToAvoidDuplicateChatChecks(t *testing.T) {
+	cache.Get().Delete(probeConfigKey)
+	cache.Get().Delete(probeHistoryKey)
+	defer cache.Get().Delete(probeConfigKey)
+	defer cache.Get().Delete(probeHistoryKey)
+
+	var mu sync.Mutex
+	chatCalls := map[string]int{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Header.Get("Authorization") == "Bearer token-a" {
+			_, _ = w.Write([]byte(`{"data":[{"id":"model-a"}]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"data":[{"id":"model-b"}]}`))
+	})
+	mux.HandleFunc("/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			Model string `json:"model"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode chat payload: %v", err)
+		}
+		mu.Lock()
+		chatCalls[payload.Model]++
+		mu.Unlock()
+		if (payload.Model == "model-a" && r.Header.Get("Authorization") != "Bearer token-a") || (payload.Model == "model-b" && r.Header.Get("Authorization") != "Bearer token-b") {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	svc := NewActiveProbeService()
+	if _, err := svc.SetConfig(ActiveProbeConfigInput{
+		Enabled: true, BaseURL: server.URL, Models: []string{"model-a", "model-b", "model-c"},
+		IntervalSeconds: 30, TimeoutSeconds: 3, ProbeMode: "chat", Token: "token-a",
+	}); err != nil {
+		t.Fatalf("set config: %v", err)
+	}
+	cfg := svc.GetConfig()
+	cfg.Tokens = []activeProbeToken{{ID: "a", Label: "A", Token: "token-a"}, {ID: "b", Label: "B", Token: "token-b"}}
+	if err := cache.Get().Set(probeConfigKey, cfg, 0); err != nil {
+		t.Fatalf("store tokens: %v", err)
+	}
+	models, err := svc.FetchModelsByTokenID(context.Background(), server.URL, "a")
+	if err != nil || len(models) != 1 || models[0] != "model-a" {
+		t.Fatalf("fetch stored token models: models=%v err=%v", models, err)
+	}
+
+	results, err := svc.RunNow(context.Background())
+	if err != nil {
+		t.Fatalf("run probe: %v", err)
+	}
+	for _, result := range results {
+		if result.Model == "model-c" {
+			if result.ModelsOK || result.ChatChecked || result.ChatOK || result.ErrorCode != "model_unavailable" {
+				t.Fatalf("unexpected unavailable-model result: %+v", result)
+			}
+			continue
+		}
+		if !result.ModelsOK || !result.ChatChecked || !result.ChatOK {
+			t.Fatalf("unexpected result: %+v", result)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if chatCalls["model-a"] != 1 || chatCalls["model-b"] != 1 {
+		t.Fatalf("expected one chat request per model, got %+v", chatCalls)
+	}
+	if chatCalls["model-c"] != 0 {
+		t.Fatalf("unsupported model should not use chat tokens, got %+v", chatCalls)
+	}
+}
+
+func TestActiveProbeLegacyTokenMigrationAndCompactWireFormat(t *testing.T) {
+	cfg := ActiveProbeConfig{Token: "test-secret"}
+	normalizeActiveProbeConfig(&cfg)
+	if cfg.Token != "" || len(cfg.Tokens) != 1 || cfg.Tokens[0].Token != "test-secret" {
+		t.Fatalf("legacy token was not migrated: %+v", cfg)
+	}
+	viewJSON, err := json.Marshal(activeProbeConfigView(cfg))
+	if err != nil {
+		t.Fatalf("marshal config view: %v", err)
+	}
+	if strings.Contains(string(viewJSON), "test-secret") {
+		t.Fatal("config view leaked token")
+	}
+	resultJSON, err := json.Marshal(ActiveProbeResult{Model: "model-a", CheckedAt: 1, LatencyMS: 2, ModelsOK: true, ChatChecked: true, ChatOK: true})
+	if err != nil {
+		t.Fatalf("marshal result: %v", err)
+	}
+	encoded := string(resultJSON)
+	for _, field := range []string{"checked_at", "latency_ms", "models_ok", "chat_ok", "error_code"} {
+		if strings.Contains(encoded, field) {
+			t.Fatalf("compact result contains long field %q: %s", field, encoded)
+		}
+	}
+
+	var migrated ActiveProbeResult
+	if err := json.Unmarshal([]byte(`{"model":"legacy-model","checked_at":10,"latency_ms":20,"models_ok":true,"chat_ok":false,"http_status":503,"error_code":"chat_http"}`), &migrated); err != nil {
+		t.Fatalf("unmarshal legacy result: %v", err)
+	}
+	if migrated.Model != "legacy-model" || migrated.CheckedAt != 10 || migrated.LatencyMS != 20 || !migrated.ModelsOK || !migrated.ChatChecked || migrated.ChatOK || migrated.HTTPStatus != 503 || migrated.ErrorCode != "chat_http" {
+		t.Fatalf("legacy result was not migrated: %+v", migrated)
 	}
 }

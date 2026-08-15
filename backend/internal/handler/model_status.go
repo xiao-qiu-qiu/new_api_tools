@@ -48,6 +48,10 @@ func RegisterModelStatusRoutes(r *gin.RouterGroup) {
 		g.GET("/token-groups", GetTokenGroupsForModelStatus)
 		g.GET("/probe/config", GetActiveProbeConfig)
 		g.PUT("/probe/config", SetActiveProbeConfig)
+		g.POST("/probe/tokens", AddActiveProbeToken)
+		g.DELETE("/probe/tokens/:id", DeleteActiveProbeToken)
+		g.POST("/probe/tokens/:id/models", FetchStoredActiveProbeModels)
+		g.POST("/probe/token-models", FetchActiveProbeModels)
 		g.POST("/probe/run", RunActiveProbe)
 		g.GET("/probe/history", GetActiveProbeHistory)
 	}
@@ -473,6 +477,65 @@ func SetActiveProbeConfig(c *gin.Context) {
 	data, err := service.NewActiveProbeService().SetConfig(req)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PROBE_CONFIG", err.Error(), ""))
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+}
+
+func AddActiveProbeToken(c *gin.Context) {
+	var req struct {
+		Token string `json:"token"`
+		Label string `json:"label"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "令牌格式不正确", ""))
+		return
+	}
+	data, err := service.NewActiveProbeService().AddToken(req.Token, req.Label)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResp("TOKEN_ERROR", err.Error(), ""))
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+}
+
+func DeleteActiveProbeToken(c *gin.Context) {
+	data, err := service.NewActiveProbeService().DeleteToken(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusNotFound, models.ErrorResp("TOKEN_NOT_FOUND", err.Error(), ""))
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+}
+
+func FetchActiveProbeModels(c *gin.Context) {
+	var req struct {
+		BaseURL string `json:"base_url"`
+		Token   string `json:"token"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "读取模型参数格式不正确", ""))
+		return
+	}
+	data, err := service.NewActiveProbeService().FetchModels(c.Request.Context(), req.BaseURL, req.Token)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResp("MODEL_LIST_ERROR", err.Error(), ""))
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+}
+
+func FetchStoredActiveProbeModels(c *gin.Context) {
+	var req struct {
+		BaseURL string `json:"base_url"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "读取模型参数格式不正确", ""))
+		return
+	}
+	data, err := service.NewActiveProbeService().FetchModelsByTokenID(c.Request.Context(), req.BaseURL, c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResp("MODEL_LIST_ERROR", err.Error(), ""))
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})

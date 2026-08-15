@@ -25,6 +25,7 @@ export interface ActiveProbeResult {
   latency_ms: number
   models_ok: boolean
   chat_ok: boolean
+  chat_checked: boolean
   http_status?: number
   error_code?: string
 }
@@ -42,6 +43,15 @@ export interface ActiveProbeConfig {
   models: string[]
   interval_seconds: number
   timeout_seconds: number
+  probe_mode: 'models' | 'chat'
+  tokens: ActiveProbeToken[]
+  token_count: number
+  has_token: boolean
+}
+
+export interface ActiveProbeToken {
+  id: string
+  label: string
   has_token: boolean
 }
 
@@ -54,8 +64,31 @@ export interface EmbedConfig {
   selected_models: string[]
   time_window: string
   refresh_interval: number
-  theme: 'system' | 'light' | 'dark'
+  theme: 'system' | 'light' | 'dark' | 'daylight' | 'obsidian'
   site_title?: string
+}
+
+export function parseActiveProbeResult(raw: Record<string, unknown>): ActiveProbeResult {
+  return {
+    model: String(raw.m ?? raw.model ?? ''),
+    checked_at: Number(raw.t ?? raw.checked_at ?? 0),
+    latency_ms: Number(raw.l ?? raw.latency_ms ?? 0),
+    models_ok: Boolean(raw.mo ?? raw.models_ok),
+    chat_checked: Boolean(raw.cc ?? raw.chat_checked ?? (raw.chat_ok !== undefined)),
+    chat_ok: Boolean(raw.co ?? raw.chat_ok),
+    http_status: raw.s === undefined ? Number(raw.http_status || 0) || undefined : Number(raw.s) || undefined,
+    error_code: String(raw.e ?? raw.error_code ?? '') || undefined,
+  }
+}
+
+export function parseActiveProbeSummary(raw: Record<string, unknown> | undefined): ActiveProbeSummary {
+  const results = Array.isArray(raw?.r) ? raw.r : Array.isArray(raw?.results) ? raw.results : []
+  return {
+    enabled: Boolean(raw?.on ?? raw?.enabled),
+    running: Boolean(raw?.run ?? raw?.running),
+    last_run_at: Number(raw?.t ?? raw?.last_run_at ?? 0) || undefined,
+    results: results.map((item) => parseActiveProbeResult((item || {}) as Record<string, unknown>)),
+  }
 }
 
 export function successRate(ok: number, total: number): number | null {
@@ -73,7 +106,7 @@ export function deriveHealth(ok: number, total: number): HealthState {
 
 export function probeHealth(result?: ActiveProbeResult): HealthState {
   if (!result) return 'empty'
-  if (result.models_ok && result.chat_ok) return 'healthy'
+  if (result.models_ok && (!result.chat_checked || result.chat_ok)) return 'healthy'
   if (result.models_ok) return 'degraded'
   return 'down'
 }

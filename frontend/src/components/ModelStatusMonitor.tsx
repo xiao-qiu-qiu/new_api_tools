@@ -1,17 +1,18 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Activity, Check, ExternalLink, KeyRound, Loader2, Play, RefreshCw, Save, Search, Settings2, ShieldCheck } from 'lucide-react'
+import { Activity, Check, ExternalLink, KeyRound, Loader2, Play, RefreshCw, Save, Search, Settings2, ShieldCheck, Trash2 } from 'lucide-react'
 import { useAuth } from '../contexts/AuthContext'
 import { apiFetch, createAuthHeaders } from '../lib/api'
 import {
   type ActiveProbeConfig, type ActiveProbeSummary, type AvailableModel, type HealthState, type ModelStatusSnapshot,
-  deriveHealth, formatRate, formatRelativeTime, healthClasses, healthLabels, probeHealth,
+  deriveHealth, formatRate, formatRelativeTime, healthClasses, healthLabels, parseActiveProbeSummary, probeHealth,
 } from '../lib/model-status'
 import { cn } from '../lib/utils'
 import { useToast } from './Toast'
 
 type ViewMode = 'traffic' | 'probe'
 const windowOptions = [{ value: '1h', label: '1 小时' }, { value: '6h', label: '6 小时' }, { value: '12h', label: '12 小时' }, { value: '24h', label: '24 小时' }]
-const emptyProbeConfig: ActiveProbeConfig = { enabled: false, base_url: '', models: [], interval_seconds: 300, timeout_seconds: 20, has_token: false }
+const emptyProbeConfig: ActiveProbeConfig = { enabled: false, base_url: '', models: [], interval_seconds: 300, timeout_seconds: 20, probe_mode: 'chat', tokens: [], token_count: 0, has_token: false }
+const themeOptions = [{ value: 'system', label: '跟随系统' }, { value: 'light', label: '新版浅色' }, { value: 'dark', label: '新版深色' }, { value: 'daylight', label: '白昼' }, { value: 'obsidian', label: '黑曜石' }] as const
 
 function StateBadge(props: { state: HealthState; label?: string }) {
   return <span className={cn('status-pill', props.state === 'healthy' && 'border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-300', props.state === 'degraded' && 'border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-300', props.state === 'down' && 'border-rose-200 bg-rose-50 text-rose-700 dark:border-rose-900 dark:bg-rose-950/40 dark:text-rose-300', props.state === 'empty' && 'border-border bg-muted text-muted-foreground')}><span className={cn('h-1.5 w-1.5 rounded-full', healthClasses[props.state])} />{props.label || healthLabels[props.state]}</span>
@@ -26,10 +27,15 @@ export function ModelStatusMonitor() {
   const [availableModels, setAvailableModels] = useState<AvailableModel[]>([])
   const [selectedModels, setSelectedModels] = useState<string[]>([])
   const [statuses, setStatuses] = useState<ModelStatusSnapshot[]>([])
-  const [windowValue, setWindowValue] = useState('24h')
+  const [windowValue, setWindowValue] = useState('1h')
+  const [themeValue, setThemeValue] = useState('system')
   const [refreshInterval, setRefreshInterval] = useState(60)
   const [probeConfig, setProbeConfig] = useState<ActiveProbeConfig>(emptyProbeConfig)
   const [probeToken, setProbeToken] = useState('')
+  const [probeTokenLabel, setProbeTokenLabel] = useState('')
+  const [probeTokenModels, setProbeTokenModels] = useState<string[]>([])
+  const [fetchingProbeModels, setFetchingProbeModels] = useState(false)
+  const [fetchingStoredTokenId, setFetchingStoredTokenId] = useState('')
   const [probeModelsText, setProbeModelsText] = useState('')
   const [probeSummary, setProbeSummary] = useState<ActiveProbeSummary>({ enabled: false, running: false, results: [] })
   const [loading, setLoading] = useState(true)
@@ -51,11 +57,12 @@ export function ModelStatusMonitor() {
       const nextProbe = probeData.data || emptyProbeConfig
       setAvailableModels(modelsData.data || [])
       setSelectedModels(selected)
-      setWindowValue(configData.time_window || '24h')
+      setWindowValue(configData.time_window || '1h')
+      setThemeValue(configData.theme || 'system')
       setRefreshInterval(Number(configData.refresh_interval ?? 60))
       setProbeConfig(nextProbe)
       setProbeModelsText((nextProbe.models || []).join('\n'))
-      setProbeSummary(summaryData.data || { enabled: false, running: false, results: [] })
+      setProbeSummary(parseActiveProbeSummary(summaryData.data))
     } catch { showToast('error', '模型监控配置加载失败') }
   }, [apiUrl, headers, showToast])
 
@@ -69,7 +76,7 @@ export function ModelStatusMonitor() {
       setStatuses(data.data || [])
       const summaryResponse = await fetch(`${apiUrl}/api/model-status/embed/probe/summary`)
       const summaryData = await summaryResponse.json()
-      if (summaryData.success) setProbeSummary(summaryData.data)
+      if (summaryData.success) setProbeSummary(parseActiveProbeSummary(summaryData.data))
     } catch { showToast('error', '模型状态读取失败') }
     finally { setLoading(false) }
   }, [apiUrl, headers, selectedModels, showToast, windowValue])
@@ -94,6 +101,7 @@ export function ModelStatusMonitor() {
       const responses = await Promise.all([
         apiFetch(`${apiUrl}/api/model-status/selected`, { method: 'PUT', headers, body: JSON.stringify({ models: selectedModels }) }),
         apiFetch(`${apiUrl}/api/model-status/config/window`, { method: 'PUT', headers, body: JSON.stringify({ time_window: windowValue }) }),
+        apiFetch(`${apiUrl}/api/model-status/config/theme`, { method: 'PUT', headers, body: JSON.stringify({ theme: themeValue }) }),
         apiFetch(`${apiUrl}/api/model-status/config/refresh`, { method: 'PUT', headers, body: JSON.stringify({ refresh_interval: refreshInterval }) }),
       ])
       if (responses.some((response) => !response.ok)) throw new Error('save_failed')
@@ -121,6 +129,60 @@ export function ModelStatusMonitor() {
     finally { setSaving(false) }
   }
 
+  const fetchProbeModels = async () => {
+    if (!probeToken.trim()) { showToast('error', '请先填写测试令牌'); return }
+    setFetchingProbeModels(true)
+    try {
+      const response = await apiFetch(`${apiUrl}/api/model-status/probe/token-models`, { method: 'POST', headers, body: JSON.stringify({ base_url: probeConfig.base_url, token: probeToken }) })
+      const data = await response.json()
+      if (!response.ok || !data.success) throw new Error(data.error?.message || '读取模型列表失败')
+      const models = Array.isArray(data.data) ? data.data.map(String) : []
+      setProbeTokenModels(models)
+      setProbeModelsText((current) => Array.from(new Set([...current.split(/[\n,]/).map((item) => item.trim()).filter(Boolean), ...models])).join('\n'))
+      showToast('success', `已读取 ${models.length} 个模型，可直接添加令牌`)
+    } catch (error) { showToast('error', error instanceof Error ? error.message : '读取模型列表失败') }
+    finally { setFetchingProbeModels(false) }
+  }
+
+  const fetchStoredTokenModels = async (id: string) => {
+    setFetchingStoredTokenId(id)
+    try {
+      const response = await apiFetch(`${apiUrl}/api/model-status/probe/tokens/${encodeURIComponent(id)}/models`, { method: 'POST', headers, body: JSON.stringify({ base_url: probeConfig.base_url }) })
+      const data = await response.json()
+      if (!response.ok || !data.success) throw new Error(data.error?.message || '读取模型列表失败')
+      const models = Array.isArray(data.data) ? data.data.map(String) : []
+      setProbeModelsText((current) => Array.from(new Set([...current.split(/[\n,]/).map((item) => item.trim()).filter(Boolean), ...models])).join('\n'))
+      showToast('success', `已读取 ${models.length} 个模型并合并到探测列表`)
+    } catch (error) { showToast('error', error instanceof Error ? error.message : '读取模型列表失败') }
+    finally { setFetchingStoredTokenId('') }
+  }
+
+  const addProbeToken = async () => {
+    if (!probeToken.trim()) { showToast('error', '请先填写测试令牌'); return }
+    setSaving(true)
+    try {
+      const response = await apiFetch(`${apiUrl}/api/model-status/probe/tokens`, { method: 'POST', headers, body: JSON.stringify({ token: probeToken, label: probeTokenLabel }) })
+      const data = await response.json()
+      if (!response.ok || !data.success) throw new Error(data.error?.message || '添加令牌失败')
+      setProbeConfig(data.data)
+      setProbeToken('')
+      setProbeTokenLabel('')
+      setProbeTokenModels([])
+      showToast('success', '测试令牌已添加')
+    } catch (error) { showToast('error', error instanceof Error ? error.message : '添加令牌失败') }
+    finally { setSaving(false) }
+  }
+
+  const removeProbeToken = async (id: string) => {
+    try {
+      const response = await apiFetch(`${apiUrl}/api/model-status/probe/tokens/${encodeURIComponent(id)}`, { method: 'DELETE', headers })
+      const data = await response.json()
+      if (!response.ok || !data.success) throw new Error(data.error?.message || '删除令牌失败')
+      setProbeConfig(data.data)
+      showToast('success', '测试令牌已删除')
+    } catch (error) { showToast('error', error instanceof Error ? error.message : '删除令牌失败') }
+  }
+
   const runProbe = async () => {
     setRunning(true)
     try {
@@ -129,7 +191,7 @@ export function ModelStatusMonitor() {
       if (!response.ok || !data.success) throw new Error(data.error?.message || 'probe_failed')
       const summaryResponse = await fetch(`${apiUrl}/api/model-status/embed/probe/summary`)
       const summaryData = await summaryResponse.json()
-      setProbeSummary(summaryData.data)
+      setProbeSummary(parseActiveProbeSummary(summaryData.data))
       showToast('success', `主动探测完成，共 ${data.data.length} 个模型`)
     } catch (error) { showToast('error', error instanceof Error && error.message !== 'probe_failed' ? error.message : '主动探测执行失败') }
     finally { setRunning(false) }
@@ -160,7 +222,9 @@ export function ModelStatusMonitor() {
 
     {modelPickerOpen && <section className="surface mb-5">
       <div className="surface-header"><div><h3 className="surface-title">展示设置</h3><p className="mt-0.5 text-xs text-muted-foreground">选择公开页与管理端要显示的模型</p></div><button type="button" className="inline-flex h-8 items-center gap-2 rounded-md bg-primary px-3 text-xs font-medium text-primary-foreground" onClick={() => void saveDisplayConfig()} disabled={saving}>{saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}保存</button></div>
-      <div className="grid gap-4 p-4 lg:grid-cols-[280px_1fr]">
+      <div className="grid gap-4 p-4 sm:grid-cols-2 lg:grid-cols-[220px_220px_220px_1fr]">
+        <div><label className="field-label">默认时间范围</label><select className="field" value={windowValue} onChange={(event) => setWindowValue(event.target.value)}>{windowOptions.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</select></div>
+        <div><label className="field-label">公开页主题</label><select className="field" value={themeValue} onChange={(event) => setThemeValue(event.target.value)}>{themeOptions.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</select></div>
         <div><label className="field-label">自动刷新</label><select className="field" value={refreshInterval} onChange={(event) => setRefreshInterval(Number(event.target.value))}><option value={0}>关闭</option><option value={30}>30 秒</option><option value={60}>60 秒</option><option value={120}>2 分钟</option><option value={300}>5 分钟</option></select></div>
         <div><label htmlFor="model-search" className="field-label">监控模型 · 已选 {selectedModels.length}</label><div className="relative"><Search className="absolute left-3 top-2.5 h-4 w-4 text-muted-foreground" /><input id="model-search" className="field pl-9" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索模型" /></div></div>
       </div>
@@ -174,11 +238,12 @@ export function ModelStatusMonitor() {
       <section className="surface">
         <div className="surface-header"><div><h3 className="surface-title">探测配置</h3><p className="mt-0.5 text-xs text-muted-foreground">默认关闭，使用独立测试令牌</p></div><KeyRound className="h-4 w-4 text-muted-foreground" /></div>
         <div className="space-y-4 p-4">
-          <label className="flex items-center justify-between gap-4"><span><span className="block text-sm font-medium">启用定时探测</span><span className="block text-xs text-muted-foreground">按间隔自动运行</span></span><button type="button" role="switch" aria-checked={probeConfig.enabled} className={cn('relative h-6 w-11 rounded-full transition-colors', probeConfig.enabled ? 'bg-primary' : 'bg-muted-foreground/30')} onClick={() => updateProbe('enabled', !probeConfig.enabled)}><span className={cn('absolute top-0.5 h-5 w-5 rounded-full bg-white shadow transition-transform', probeConfig.enabled ? 'translate-x-5' : 'translate-x-0.5')} /></button></label>
+          <label className="flex items-center justify-between gap-4"><span><span className="block text-sm font-medium">启用定时探测</span><span className="block text-xs text-muted-foreground">按间隔自动运行</span></span><button type="button" role="switch" aria-checked={probeConfig.enabled} className={cn('relative h-6 w-11 rounded-full transition-colors', probeConfig.enabled ? 'bg-primary' : 'bg-muted-foreground/30')} onClick={() => updateProbe('enabled', !probeConfig.enabled)}><span className={cn('absolute left-0.5 top-0.5 h-5 w-5 rounded-full bg-white shadow transition-transform', probeConfig.enabled ? 'translate-x-5' : 'translate-x-0')} /></button></label>
           <div><label className="field-label">NewAPI 地址</label><input className="field" value={probeConfig.base_url} onChange={(event) => updateProbe('base_url', event.target.value)} placeholder="http://new-api:3000" /></div>
+          <div><label className="field-label">探测方式</label><select className="field" value={probeConfig.probe_mode} onChange={(event) => updateProbe('probe_mode', event.target.value as ActiveProbeConfig['probe_mode'])}><option value="chat">模型列表 + 1 token 聊天校验</option><option value="models">仅模型列表（零聊天 token）</option></select><p className="mt-1 text-xs text-muted-foreground">聊天校验每个模型最多消耗 1 个输出 token；只看列表时不产生聊天 token。</p></div>
+          <div className="space-y-2"><label className="field-label">测试令牌 · 已配置 {probeConfig.token_count}</label>{probeConfig.tokens.map((item) => <div key={item.id} className="flex items-center gap-2 rounded-md border border-border bg-muted/30 px-3 py-2"><KeyRound className="h-3.5 w-3.5 shrink-0 text-muted-foreground" /><span className="min-w-0 flex-1 truncate text-sm">{item.label || '未命名令牌'}</span><span className="hidden text-xs text-muted-foreground sm:inline">密钥不回显</span><button type="button" className="inline-flex h-7 shrink-0 items-center gap-1.5 rounded-md border border-border px-2 text-xs hover:bg-muted disabled:pointer-events-none disabled:opacity-50" onClick={() => void fetchStoredTokenModels(item.id)} disabled={Boolean(fetchingStoredTokenId) || saving} title="读取此令牌支持的模型">{fetchingStoredTokenId === item.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Search className="h-3.5 w-3.5" />}模型</button><button type="button" className="icon-button h-7 w-7" onClick={() => void removeProbeToken(item.id)} aria-label={`删除${item.label || '令牌'}`} title="删除令牌"><Trash2 className="h-3.5 w-3.5" /></button></div>)}<div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_140px]"><input className="field" type="password" value={probeToken} onChange={(event) => setProbeToken(event.target.value)} placeholder="粘贴新的测试令牌" autoComplete="new-password" /><input className="field" value={probeTokenLabel} onChange={(event) => setProbeTokenLabel(event.target.value)} placeholder="标签（可选）" /></div><div className="flex flex-wrap gap-2"><button type="button" className="inline-flex h-9 items-center gap-2 rounded-md border border-border px-3 text-sm hover:bg-muted" onClick={() => void fetchProbeModels()} disabled={fetchingProbeModels || saving || !probeToken.trim()}>{fetchingProbeModels ? <Loader2 className="h-4 w-4 animate-spin" /> : <Search className="h-4 w-4" />}添加前读取</button><button type="button" className="inline-flex h-9 items-center gap-2 rounded-md bg-primary px-3 text-sm font-medium text-primary-foreground" onClick={() => void addProbeToken()} disabled={saving || fetchingProbeModels || !probeToken.trim()}><KeyRound className="h-4 w-4" />添加令牌</button>{probeTokenModels.length > 0 && <span className="self-center text-xs text-emerald-600">已读取 {probeTokenModels.length} 个模型，已合并到下方列表</span>}</div></div>
           <div><label className="field-label">探测模型</label><textarea className="min-h-28 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" value={probeModelsText} onChange={(event) => setProbeModelsText(event.target.value)} placeholder={'每行一个模型\ngpt-4o-mini'} /></div>
           <div className="grid grid-cols-2 gap-3"><div><label className="field-label">间隔（秒）</label><input className="field" type="number" min={30} max={86400} value={probeConfig.interval_seconds} onChange={(event) => updateProbe('interval_seconds', Number(event.target.value))} /></div><div><label className="field-label">超时（秒）</label><input className="field" type="number" min={3} max={120} value={probeConfig.timeout_seconds} onChange={(event) => updateProbe('timeout_seconds', Number(event.target.value))} /></div></div>
-          <div><label className="field-label">测试令牌 {probeConfig.has_token && <span className="text-emerald-600">· 已配置</span>}</label><input className="field" type="password" value={probeToken} onChange={(event) => setProbeToken(event.target.value)} placeholder={probeConfig.has_token ? '留空则保持原令牌' : 'sk-...'} autoComplete="new-password" /></div>
           <div className="flex gap-2"><button type="button" className="inline-flex h-9 flex-1 items-center justify-center gap-2 rounded-md border border-border text-sm hover:bg-muted" onClick={() => void runProbe()} disabled={running || saving}>{running ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}立即探测</button><button type="button" className="inline-flex h-9 flex-1 items-center justify-center gap-2 rounded-md bg-primary text-sm font-medium text-primary-foreground" onClick={() => void saveProbeConfig()} disabled={saving || running}>{saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}保存配置</button></div>
         </div>
       </section>

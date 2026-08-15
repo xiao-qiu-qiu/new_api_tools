@@ -137,11 +137,14 @@ bash <(curl -sSL https://raw.githubusercontent.com/xiao-qiu-qiu/new_api_tools/ma
 模型状态页明确区分两类信号：
 
 - **用户流量健康度**：读取 NewAPI `logs` 表，按请求数、成功数、空响应和失败数聚合。API 只返回紧凑原始计数，成功率、状态和颜色由前端计算；没有请求时显示“无数据”，不会显示为绿色。
-- **主动探测**：定时调用 NewAPI 的 `GET /v1/models`，再对配置的模型发送最小 `POST /v1/chat/completions` 请求。此功能默认关闭，可在「模型状态 → 主动探测」中配置并立即执行。
+- **主动探测**：支持多个独立测试令牌。每次先按令牌调用 NewAPI 的 `GET /v1/models`，只用明确支持目标模型的令牌发送后续请求。令牌行右侧可直接读取其模型并合并到探测列表。
+- **探测方式**：`模型列表 + 1 token 聊天校验` 会为每个模型发送 `ping`，并把最大输出限制为 1 token；`仅模型列表` 只检查 `/v1/models`，不产生聊天 token。功能默认关闭，可在「模型状态 → 主动探测」中配置并立即执行。
 
-建议为探测单独创建低额度测试令牌。令牌保存在内部 Redis 配置中，管理接口只返回 `has_token`，不会回传令牌；日志与探测历史也不保存请求体或上游响应体。
+建议按模型权限拆分低额度测试令牌。令牌保存在内部 Redis 配置中，管理接口只返回令牌 ID、标签和存在标记，不会回传令牌值；日志与探测历史也不保存请求体或上游响应体。
 
-公开状态页为 `/embed.html`。主题、模型和刷新间隔读取管理端保存的配置，不需要 URL 颜色参数。页面可直接通过 iframe 嵌入，容器内 Nginx 仅对这个公开入口放开 `frame-ancestors`。
+公开状态页为 `/embed.html`，默认展示 `1h`。访客可以在 `1h / 6h / 12h / 24h` 之间切换，管理员可配置默认时间范围。主题支持跟随系统、新版浅色、新版深色、白昼和黑曜石，不需要 URL 颜色参数。页面可直接通过 iframe 嵌入，容器内 Nginx 仅对这个公开入口放开 `frame-ancestors`。
+
+公开状态接口只传输原始计数和紧凑探测字段；时间段结束值、成功率、健康状态、颜色及显示文案均由前端推导。主动探测结果字段为 `m/t/l/mo/cc/co/s/e`，前端同时兼容升级前的长字段缓存。
 
 ## 联合违规广播接入
 
@@ -186,7 +189,7 @@ npm run dev
 | 兑换码 | `GET /api/redemptions`、`POST /api/redemptions/generate` |
 | 风控 | `GET /api/risk/*`、`GET /api/ip/*`、`POST /api/ai-ban/*` |
 | 联合广播 | `GET /api/abuse-broadcast/*`、`POST /api/abuse-broadcast/*` |
-| 模型状态 | `GET /api/model-status/*`、`PUT /api/model-status/probe/config`、`POST /api/model-status/probe/run`、`GET /api/model-status/embed/*` |
+| 模型状态 | `GET /api/model-status/*`、`PUT /api/model-status/probe/config`、`POST/DELETE /api/model-status/probe/tokens*`、`POST /api/model-status/probe/run`、`GET /api/model-status/embed/*` |
 | 用户与令牌 | `GET /api/users`、`GET /api/tokens`、`GET /api/auto-group/*` |
 | 存储与系统 | `GET /api/storage/*`、`GET /api/system/*` |
 

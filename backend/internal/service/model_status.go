@@ -12,18 +12,16 @@ import (
 // Constants for model status
 var (
 	AvailableTimeWindows = []string{"1h", "6h", "12h", "24h"}
-	DefaultTimeWindow    = "24h"
-	AvailableThemes      = []string{"system", "light", "dark"}
+	DefaultTimeWindow    = "1h"
+	AvailableThemes      = []string{"system", "light", "dark", "daylight", "obsidian"}
 	DefaultTheme         = "system"
 	// LegacyThemeMap maps old theme names to valid ones
 	LegacyThemeMap = map[string]string{
-		"daylight":  "light",
 		"cupertino": "light",
 		"material":  "light",
 		"openai":    "light",
 		"anthropic": "light",
 		"stripe":    "light",
-		"obsidian":  "dark",
 		"minimal":   "light",
 		"neon":      "dark",
 		"forest":    "dark",
