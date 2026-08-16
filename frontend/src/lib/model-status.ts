@@ -1,5 +1,14 @@
 export type HealthState = 'healthy' | 'degraded' | 'down' | 'empty'
 
+export interface HealthSummary {
+  state: HealthState
+  total: number
+  healthy: number
+  degraded: number
+  down: number
+  availability: number
+}
+
 export interface CompactStatusSlot {
   t: number
   n: number
@@ -131,6 +140,27 @@ export function worstHealth(...states: HealthState[]): HealthState {
     if (healthPriority[state] > healthPriority[result]) result = state
   }
   return result
+}
+
+export function summarizeHealthStates(states: HealthState[]): HealthSummary {
+  let healthy = 0
+  let degraded = 0
+  let down = 0
+  for (const state of states) {
+    if (state === 'healthy') healthy++
+    else if (state === 'degraded') degraded++
+    else if (state === 'down') down++
+  }
+  const total = healthy + degraded + down
+  if (!total) return { state: 'empty', total, healthy, degraded, down, availability: 0 }
+
+  const availability = Math.round(((healthy + degraded * 0.5) / total) * 100)
+  const state: HealthState = down === 0 && degraded === 0
+    ? 'healthy'
+    : availability >= 70
+      ? 'degraded'
+      : 'down'
+  return { state, total, healthy, degraded, down, availability }
 }
 
 export function deriveProbeSlotHealth(slotStart: number, step: number, results: ActiveProbeResult[]): HealthState {

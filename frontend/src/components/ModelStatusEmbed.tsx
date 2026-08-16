@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Activity, Clock3, RefreshCw, ShieldCheck } from 'lucide-react'
 import {
   type ActiveProbeResult, type ActiveProbeSummary, type EmbedConfig, type HealthState, type ModelStatusSnapshot,
-  deriveHealth, deriveProbeSlotHealth, formatRate, formatRelativeTime, healthClasses, healthLabels, parseActiveProbeResults, parseActiveProbeSummary, probeHealth, worstHealth,
+  deriveHealth, deriveProbeSlotHealth, formatRate, formatRelativeTime, healthClasses, healthLabels, parseActiveProbeResults, parseActiveProbeSummary, probeHealth, summarizeHealthStates, worstHealth,
 } from '../lib/model-status'
 import { cn } from '../lib/utils'
 
@@ -71,8 +71,8 @@ export function ModelStatusEmbed() {
     return history
   }, [probeHistory])
   const overall = useMemo(() => statuses.reduce((acc, item) => ({ total: acc.total + item.total, ok: acc.ok + item.ok }), { total: 0, ok: 0 }), [statuses])
-  const overallState = useMemo(() => statuses.reduce((state, status) => worstHealth(state, probeHealth(probeByModel.get(status.model))), deriveHealth(overall.ok, overall.total)), [overall.ok, overall.total, probeByModel, statuses])
-  const probeIssueCount = useMemo(() => statuses.filter((status) => { const state = probeHealth(probeByModel.get(status.model)); return state === 'degraded' || state === 'down' }).length, [probeByModel, statuses])
+  const overallSummary = useMemo(() => summarizeHealthStates(statuses.map((status) => worstHealth(deriveHealth(status.ok, status.total), probeHealth(probeByModel.get(status.model))))), [probeByModel, statuses])
+  const affectedModels = overallSummary.degraded + overallSummary.down
   const title = config.site_title?.trim() || '模型服务状态'
 
   return <main className="min-h-screen bg-background text-foreground">
@@ -86,7 +86,7 @@ export function ModelStatusEmbed() {
 
     <div className="mx-auto max-w-6xl px-4 py-5 sm:px-6 sm:py-8">
       <section className="mb-5 grid gap-3 sm:grid-cols-3" aria-label="总体状态">
-        <div className="surface p-4"><div className="text-xs text-muted-foreground">总体状态</div><div className="mt-2"><PublicBadge state={overallState} /></div><div className="mt-2 text-xs text-muted-foreground">{probeIssueCount ? `${probeIssueCount} 个模型主动探测异常` : overall.total ? `${formatRate(overall.ok, overall.total)} 流量成功率` : '当前窗口没有用户请求'}</div></div>
+        <div className="surface p-4"><div className="text-xs text-muted-foreground">总体状态</div><div className="mt-2"><PublicBadge state={overallSummary.state} /></div><div className="mt-2 text-xs text-muted-foreground">{overallSummary.total ? affectedModels ? `${affectedModels} 个模型受影响 · 可用度 ${overallSummary.availability}%` : `${overallSummary.total} 个模型状态正常` : '暂无可判断的模型状态'}</div></div>
         <div className="surface p-4"><div className="flex items-center gap-1.5 text-xs text-muted-foreground"><Activity className="h-3.5 w-3.5" />用户流量</div><div className="mt-2 text-2xl font-semibold tabular-nums">{overall.total.toLocaleString()}</div><div className="mt-1 text-xs text-muted-foreground">统计窗口 {windowValue || config.time_window}</div></div>
         <div className="surface p-4"><div className="flex items-center gap-1.5 text-xs text-muted-foreground"><ShieldCheck className="h-3.5 w-3.5" />主动探测</div><div className="mt-2 text-2xl font-semibold tabular-nums">{probeSummary.results.length}</div><div className="mt-1 text-xs text-muted-foreground">{probeSummary.enabled ? `最近运行于 ${formatRelativeTime(probeSummary.last_run_at)}` : '定时探测未启用'}</div></div>
       </section>

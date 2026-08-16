@@ -1,10 +1,13 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Activity, Check, ChevronDown, ExternalLink, KeyRound, Loader2, Play, RefreshCw, Save, Search, Settings2, ShieldCheck, Trash2 } from 'lucide-react'
+import { closestCenter, DndContext, KeyboardSensor, PointerSensor, useSensor, useSensors, type DragEndEvent } from '@dnd-kit/core'
+import { arrayMove, SortableContext, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable'
+import { CSS } from '@dnd-kit/utilities'
+import { Activity, Check, ChevronDown, ExternalLink, GripVertical, KeyRound, Loader2, Play, RefreshCw, Save, Search, Settings2, ShieldCheck, Trash2 } from 'lucide-react'
 import { useAuth } from '../contexts/AuthContext'
 import { apiFetch, createAuthHeaders } from '../lib/api'
 import {
   type ActiveProbeConfig, type ActiveProbeResult, type ActiveProbeSummary, type ActiveProbeToken, type AvailableModel, type HealthState, type ModelStatusSnapshot,
-  deriveHealth, deriveProbeSlotHealth, formatRate, formatRelativeTime, healthClasses, healthLabels, parseActiveProbeResults, parseActiveProbeSummary, probeHealth, worstHealth,
+  deriveHealth, deriveProbeSlotHealth, formatRate, formatRelativeTime, healthClasses, healthLabels, parseActiveProbeResults, parseActiveProbeSummary, probeHealth, summarizeHealthStates, worstHealth,
 } from '../lib/model-status'
 import { cn } from '../lib/utils'
 import { useToast } from './Toast'
@@ -23,11 +26,24 @@ function StateBadge(props: { state: HealthState; label?: string }) {
   return <span className={cn('status-pill', props.state === 'healthy' && 'border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-300', props.state === 'degraded' && 'border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-300', props.state === 'down' && 'border-rose-200 bg-rose-50 text-rose-700 dark:border-rose-900 dark:bg-rose-950/40 dark:text-rose-300', props.state === 'empty' && 'border-border bg-muted text-muted-foreground')}><span className={cn('h-1.5 w-1.5 rounded-full', healthClasses[props.state])} />{props.label || healthLabels[props.state]}</span>
 }
 
+function SortableModelRow(props: { model: string; index: number }) {
+  const { attributes, isDragging, listeners, setNodeRef, transform, transition } = useSortable({ id: props.model })
+  return <div ref={setNodeRef} style={{ transform: CSS.Transform.toString(transform), transition }} className={cn('flex min-w-0 items-center gap-2 border-b border-border px-3 py-2 last:border-b-0', isDragging && 'relative z-10 bg-background shadow-sm')}>
+    <span className="w-6 shrink-0 text-center text-xs tabular-nums text-muted-foreground">{props.index + 1}</span>
+    <span className="min-w-0 flex-1 truncate text-sm" title={props.model}>{props.model}</span>
+    <button type="button" className="icon-button h-7 w-7 cursor-grab touch-none active:cursor-grabbing" aria-label={`拖动 ${props.model}`} {...attributes} {...listeners}><GripVertical className="h-4 w-4" /></button>
+  </div>
+}
+
 export function ModelStatusMonitor() {
   const { token } = useAuth()
   const { showToast } = useToast()
   const apiUrl = import.meta.env.VITE_API_URL || ''
   const headers = useMemo(() => createAuthHeaders(token), [token])
+  const sortSensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+  )
   const [view, setView] = useState<ViewMode>('traffic')
   const [availableModels, setAvailableModels] = useState<AvailableModel[]>([])
   const [selectedModels, setSelectedModels] = useState<string[]>([])
@@ -133,9 +149,19 @@ export function ModelStatusMonitor() {
   }, [availableModels, probeConfig.models, probeConfig.tokens, probeSummary.results, selectedModels])
   const filteredModels = useMemo(() => displayModels.filter((item) => item.model_name.toLowerCase().includes(search.toLowerCase())), [displayModels, search])
   const overall = useMemo(() => statuses.reduce((acc, item) => ({ total: acc.total + item.total, ok: acc.ok + item.ok }), { total: 0, ok: 0 }), [statuses])
-  const probeOverallState = useMemo(() => probeSummary.results.reduce<HealthState>((state, item) => worstHealth(state, probeHealth(item)), 'empty'), [probeSummary.results])
+  const probeOverallSummary = useMemo(() => summarizeHealthStates(probeSummary.results.map((item) => probeHealth(item))), [probeSummary.results])
+  const selectedModelOrder = useMemo(() => new Map(selectedModels.map((model, index) => [model, index])), [selectedModels])
+  const orderedProbeResults = useMemo(() => [...probeSummary.results].sort((left, right) => (selectedModelOrder.get(left.model) ?? Number.MAX_SAFE_INTEGER) - (selectedModelOrder.get(right.model) ?? Number.MAX_SAFE_INTEGER) || left.model.localeCompare(right.model)), [probeSummary.results, selectedModelOrder])
 
   const toggleModel = (model: string) => setSelectedModels((current) => current.includes(model) ? current.filter((item) => item !== model) : [...current, model])
+  const reorderModels = (event: DragEndEvent) => {
+    if (!event.over || event.active.id === event.over.id) return
+    setSelectedModels((current) => {
+      const from = current.indexOf(String(event.active.id))
+      const to = current.indexOf(String(event.over?.id))
+      return from < 0 || to < 0 ? current : arrayMove(current, from, to)
+    })
+  }
 
   const saveDisplayConfig = async () => {
     setSaving(true)
@@ -302,7 +328,7 @@ export function ModelStatusMonitor() {
     <div className="mb-5 grid gap-3 sm:grid-cols-3">
       <div className="surface p-4"><div className="text-xs text-muted-foreground">流量请求</div><div className="mt-2 text-2xl font-semibold tabular-nums">{overall.total.toLocaleString()}</div><div className="mt-1 text-xs text-muted-foreground">成功率 {formatRate(overall.ok, overall.total)}</div></div>
       <div className="surface p-4"><div className="text-xs text-muted-foreground">流量健康度</div><div className="mt-2"><StateBadge state={deriveHealth(overall.ok, overall.total)} /></div><div className="mt-2 text-xs text-muted-foreground">按当前 {windowValue} 窗口计算</div></div>
-      <div className="surface p-4"><div className="text-xs text-muted-foreground">主动探测</div><div className="mt-2 flex items-center gap-2"><StateBadge state={probeOverallState} label={probeSummary.enabled ? healthLabels[probeOverallState] : '未启用'} /></div><div className="mt-2 text-xs text-muted-foreground">{formatRelativeTime(probeSummary.last_run_at)}</div></div>
+      <div className="surface p-4"><div className="text-xs text-muted-foreground">主动探测</div><div className="mt-2 flex items-center gap-2"><StateBadge state={probeOverallSummary.state} label={probeSummary.enabled ? healthLabels[probeOverallSummary.state] : '未启用'} /></div><div className="mt-2 text-xs text-muted-foreground">{probeOverallSummary.total ? `可用度 ${probeOverallSummary.availability}% · ${formatRelativeTime(probeSummary.last_run_at)}` : formatRelativeTime(probeSummary.last_run_at)}</div></div>
     </div>
 
     <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
@@ -314,13 +340,18 @@ export function ModelStatusMonitor() {
     </div>
 
     {modelPickerOpen && <section className="surface mb-5">
-      <div className="surface-header"><div><h3 className="surface-title">展示设置</h3><p className="mt-0.5 text-xs text-muted-foreground">选择公开页与管理端要显示的模型</p></div><button type="button" className="inline-flex h-8 items-center gap-2 rounded-md bg-primary px-3 text-xs font-medium text-primary-foreground" onClick={() => void saveDisplayConfig()} disabled={saving}>{saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}保存</button></div>
+      <div className="surface-header"><div><h3 className="surface-title">展示设置</h3><p className="mt-0.5 text-xs text-muted-foreground">选择模型并调整管理端与公开页的显示顺序</p></div><button type="button" className="inline-flex h-8 items-center gap-2 rounded-md bg-primary px-3 text-xs font-medium text-primary-foreground" onClick={() => void saveDisplayConfig()} disabled={saving}>{saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}保存</button></div>
       <div className="grid gap-4 p-4 sm:grid-cols-2 lg:grid-cols-[220px_220px_220px_1fr]">
         <div><label className="field-label">默认时间范围</label><select className="field" value={windowValue} onChange={(event) => setWindowValue(event.target.value)}>{windowOptions.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</select></div>
         <div><label className="field-label">公开页主题</label><select className="field" value={themeValue} onChange={(event) => setThemeValue(event.target.value)}>{themeOptions.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</select></div>
         <div><label className="field-label">自动刷新</label><select className="field" value={refreshInterval} onChange={(event) => setRefreshInterval(Number(event.target.value))}><option value={0}>关闭</option><option value={30}>30 秒</option><option value={60}>60 秒</option><option value={120}>2 分钟</option><option value={300}>5 分钟</option></select></div>
         <div><label htmlFor="model-search" className="field-label">监控模型 · 已选 {selectedModels.length}</label><div className="relative"><Search className="absolute left-3 top-2.5 h-4 w-4 text-muted-foreground" /><input id="model-search" className="field pl-9" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索模型" /></div></div>
       </div>
+      <div className="border-t border-border">
+        <div className="flex items-center justify-between gap-3 px-4 py-3"><div><div className="text-sm font-medium">显示顺序</div><div className="text-xs text-muted-foreground">拖动手柄调整，保存后公开页同步生效</div></div><span className="text-xs tabular-nums text-muted-foreground">{selectedModels.length} 个模型</span></div>
+        {selectedModels.length ? <DndContext sensors={sortSensors} collisionDetection={closestCenter} onDragEnd={reorderModels}><SortableContext items={selectedModels} strategy={verticalListSortingStrategy}><div className="max-h-64 overflow-y-auto border-t border-border">{selectedModels.map((model, index) => <SortableModelRow key={model} model={model} index={index} />)}</div></SortableContext></DndContext> : <div className="border-t border-border px-4 py-6 text-center text-xs text-muted-foreground">请先选择要展示的模型</div>}
+      </div>
+      <div className="flex items-center justify-between gap-3 border-t border-border px-4 py-3"><div className="text-sm font-medium">选择模型</div><div className="text-xs text-muted-foreground">搜索结果不影响上方排序</div></div>
       <div className="grid max-h-64 grid-cols-1 overflow-y-auto border-t border-border p-2 sm:grid-cols-2 lg:grid-cols-3">{filteredModels.map((item) => { const checked = selectedModels.includes(item.model_name); return <button key={item.model_name} type="button" onClick={() => toggleModel(item.model_name)} className="flex min-w-0 items-center gap-2 rounded-md px-2 py-2 text-left hover:bg-muted"><span className={cn('flex h-4 w-4 shrink-0 items-center justify-center rounded border', checked ? 'border-primary bg-primary text-primary-foreground' : 'border-input')}>{checked && <Check className="h-3 w-3" />}</span><span className="min-w-0 flex-1 truncate text-sm">{item.model_name}</span><span className={cn('shrink-0 rounded px-1.5 py-0.5 text-[11px]', item.hasProbe ? 'bg-sky-50 text-sky-700 dark:bg-sky-950/50 dark:text-sky-300' : 'bg-muted text-muted-foreground')}>{item.hasTraffic && item.hasProbe ? '流量 + 探测' : item.hasProbe ? '探测' : item.hasTraffic ? '流量' : '已选择'}</span>{item.hasTraffic && <span className="shrink-0 text-xs tabular-nums text-muted-foreground">{Number(item.request_count_24h || 0).toLocaleString()}</span>}</button> })}</div>
     </section>}
 
@@ -375,7 +406,7 @@ export function ModelStatusMonitor() {
       </section>
       <section className="surface overflow-hidden">
         <div className="surface-header"><div><h3 className="surface-title">最近探测结果</h3><p className="mt-0.5 text-xs text-muted-foreground">先验证模型归属，再发起最小聊天请求</p></div><ShieldCheck className="h-4 w-4 text-muted-foreground" /></div>
-        {probeSummary.results.length ? <div className="divide-y divide-border">{probeSummary.results.map((result) => { const state = probeHealth(result); return <div key={result.model} className="flex items-center gap-3 px-4 py-3"><span className={cn('h-2 w-2 shrink-0 rounded-full', healthClasses[state])} /><div className="min-w-0 flex-1"><div className="truncate text-sm font-medium">{result.model}</div><div className="mt-0.5 text-xs text-muted-foreground">{formatRelativeTime(result.checked_at)}{result.error_code ? ` · ${result.error_code}` : ''}</div></div><div className="text-right"><StateBadge state={state} /><div className="mt-1 text-xs tabular-nums text-muted-foreground">{result.chat_ok ? `${result.latency_ms} ms` : result.http_status || '--'}</div></div></div> })}</div> : <div className="flex h-72 flex-col items-center justify-center text-sm text-muted-foreground"><ShieldCheck className="mb-2 h-7 w-7 opacity-40" />尚无主动探测记录</div>}
+        {orderedProbeResults.length ? <div className="divide-y divide-border">{orderedProbeResults.map((result) => { const state = probeHealth(result); return <div key={result.model} className="flex items-center gap-3 px-4 py-3"><span className={cn('h-2 w-2 shrink-0 rounded-full', healthClasses[state])} /><div className="min-w-0 flex-1"><div className="truncate text-sm font-medium">{result.model}</div><div className="mt-0.5 text-xs text-muted-foreground">{formatRelativeTime(result.checked_at)}{result.error_code ? ` · ${result.error_code}` : ''}</div></div><div className="text-right"><StateBadge state={state} /><div className="mt-1 text-xs tabular-nums text-muted-foreground">{result.chat_ok ? `${result.latency_ms} ms` : result.http_status || '--'}</div></div></div> })}</div> : <div className="flex h-72 flex-col items-center justify-center text-sm text-muted-foreground"><ShieldCheck className="mb-2 h-7 w-7 opacity-40" />尚无主动探测记录</div>}
       </section>
     </div>}
   </div>
