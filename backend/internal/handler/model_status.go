@@ -49,6 +49,7 @@ func RegisterModelStatusRoutes(r *gin.RouterGroup) {
 		g.GET("/probe/config", GetActiveProbeConfig)
 		g.PUT("/probe/config", SetActiveProbeConfig)
 		g.POST("/probe/tokens", AddActiveProbeToken)
+		g.PATCH("/probe/tokens/:id", UpdateActiveProbeToken)
 		g.DELETE("/probe/tokens/:id", DeleteActiveProbeToken)
 		g.POST("/probe/tokens/:id/models", FetchStoredActiveProbeModels)
 		g.POST("/probe/token-models", FetchActiveProbeModels)
@@ -484,16 +485,37 @@ func SetActiveProbeConfig(c *gin.Context) {
 
 func AddActiveProbeToken(c *gin.Context) {
 	var req struct {
-		Token string `json:"token"`
-		Label string `json:"label"`
+		Token  string   `json:"token"`
+		Label  string   `json:"label"`
+		Models []string `json:"models"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "令牌格式不正确", ""))
 		return
 	}
-	data, err := service.NewActiveProbeService().AddToken(req.Token, req.Label)
+	data, err := service.NewActiveProbeService().AddToken(req.Token, req.Label, req.Models)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, models.ErrorResp("TOKEN_ERROR", err.Error(), ""))
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+}
+
+func UpdateActiveProbeToken(c *gin.Context) {
+	var req struct {
+		Label string `json:"label"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "令牌备注格式不正确", ""))
+		return
+	}
+	data, err := service.NewActiveProbeService().UpdateTokenLabel(c.Param("id"), req.Label)
+	if err != nil {
+		status := http.StatusBadRequest
+		if err.Error() == "测试令牌不存在" {
+			status = http.StatusNotFound
+		}
+		c.JSON(status, models.ErrorResp("TOKEN_ERROR", err.Error(), ""))
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})

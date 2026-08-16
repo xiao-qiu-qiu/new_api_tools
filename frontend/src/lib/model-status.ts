@@ -53,6 +53,7 @@ export interface ActiveProbeToken {
   id: string
   label: string
   has_token: boolean
+  models: string[]
 }
 
 export interface AvailableModel {

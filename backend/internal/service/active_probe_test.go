@@ -80,7 +80,7 @@ func TestActiveProbeRunsModelsAndChatWithoutExposingToken(t *testing.T) {
 	}
 }
 
-func TestActiveProbeRetriesWithMaxCompletionTokens(t *testing.T) {
+func TestActiveProbeRetriesWithMaxTokens(t *testing.T) {
 	var requests atomic.Int32
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
@@ -89,12 +89,16 @@ func TestActiveProbeRetriesWithMaxCompletionTokens(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			t.Fatalf("decode chat payload: %v", err)
 		}
-		if _, ok := payload["max_completion_tokens"]; ok {
+		messages, _ := payload["messages"].([]interface{})
+		if len(messages) != 1 || messages[0].(map[string]interface{})["content"] != "1" {
+			t.Fatalf("probe prompt was not minimal: %+v", payload["messages"])
+		}
+		if _, ok := payload["max_tokens"]; ok {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
-		if _, ok := payload["max_tokens"]; !ok {
-			t.Fatal("first request did not include max_tokens")
+		if _, ok := payload["max_completion_tokens"]; !ok {
+			t.Fatal("first request did not include max_completion_tokens")
 		}
 		w.WriteHeader(http.StatusBadRequest)
 	})
@@ -110,6 +114,52 @@ func TestActiveProbeRetriesWithMaxCompletionTokens(t *testing.T) {
 	}
 	if requests.Load() != 2 {
 		t.Fatalf("expected 2 requests, got %d", requests.Load())
+	}
+}
+
+func TestActiveProbeTokenMetadataPersistsWithoutExposingSecret(t *testing.T) {
+	cache.Get().Delete(probeConfigKey)
+	defer cache.Get().Delete(probeConfigKey)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer metadata-secret" {
+			t.Fatalf("unexpected authorization header")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"model-z"},{"id":"model-a"},{"id":"model-a"}]}`))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	svc := NewActiveProbeService()
+	view, err := svc.AddToken("metadata-secret", "初始备注", []string{"manual-b", "manual-a", "manual-a"})
+	if err != nil {
+		t.Fatalf("add token: %v", err)
+	}
+	if len(view.Tokens) != 1 || strings.Join(view.Tokens[0].Models, ",") != "manual-a,manual-b" {
+		t.Fatalf("unexpected initial token metadata: %+v", view.Tokens)
+	}
+
+	models, err := svc.FetchModelsByTokenID(context.Background(), server.URL, view.Tokens[0].ID)
+	if err != nil {
+		t.Fatalf("fetch token models: %v", err)
+	}
+	if strings.Join(models, ",") != "model-a,model-z" {
+		t.Fatalf("models were not normalized: %v", models)
+	}
+	view = svc.GetConfigView()
+	if strings.Join(view.Tokens[0].Models, ",") != "model-a,model-z" {
+		t.Fatalf("fetched models were not persisted: %+v", view.Tokens[0])
+	}
+
+	view, err = svc.UpdateTokenLabel(view.Tokens[0].ID, "生产分组")
+	if err != nil || view.Tokens[0].Label != "生产分组" {
+		t.Fatalf("update token label: view=%+v err=%v", view, err)
+	}
+	encoded, _ := json.Marshal(view)
+	if strings.Contains(string(encoded), "metadata-secret") {
+		t.Fatal("config view leaked token")
 	}
 }
 
