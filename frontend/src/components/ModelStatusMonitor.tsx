@@ -3,8 +3,8 @@ import { Activity, Check, ChevronDown, ExternalLink, KeyRound, Loader2, Play, Re
 import { useAuth } from '../contexts/AuthContext'
 import { apiFetch, createAuthHeaders } from '../lib/api'
 import {
-  type ActiveProbeConfig, type ActiveProbeSummary, type ActiveProbeToken, type AvailableModel, type HealthState, type ModelStatusSnapshot,
-  deriveHealth, formatRate, formatRelativeTime, healthClasses, healthLabels, parseActiveProbeSummary, probeHealth,
+  type ActiveProbeConfig, type ActiveProbeResult, type ActiveProbeSummary, type ActiveProbeToken, type AvailableModel, type HealthState, type ModelStatusSnapshot,
+  deriveHealth, deriveProbeSlotHealth, formatRate, formatRelativeTime, healthClasses, healthLabels, parseActiveProbeResults, parseActiveProbeSummary, probeHealth, worstHealth,
 } from '../lib/model-status'
 import { cn } from '../lib/utils'
 import { useToast } from './Toast'
@@ -46,6 +46,7 @@ export function ModelStatusMonitor() {
   const [savingTokenId, setSavingTokenId] = useState('')
   const [dirtyTokenIds, setDirtyTokenIds] = useState<string[]>([])
   const [probeSummary, setProbeSummary] = useState<ActiveProbeSummary>({ enabled: false, running: false, results: [] })
+  const [probeHistory, setProbeHistory] = useState<ActiveProbeResult[]>([])
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [running, setRunning] = useState(false)
@@ -79,13 +80,16 @@ export function ModelStatusMonitor() {
     if (!selectedModels.length) { setStatuses([]); setLoading(false); return }
     setLoading(true)
     try {
-      const response = await apiFetch(`${apiUrl}/api/model-status/status/batch?window=${windowValue}`, { method: 'POST', headers, body: JSON.stringify(selectedModels) })
-      const data = await response.json()
+      const [response, summaryResponse, historyResponse] = await Promise.all([
+        apiFetch(`${apiUrl}/api/model-status/status/batch?window=${windowValue}`, { method: 'POST', headers, body: JSON.stringify(selectedModels) }),
+        fetch(`${apiUrl}/api/model-status/embed/probe/summary`),
+        fetch(`${apiUrl}/api/model-status/embed/probe/history?limit=200`),
+      ])
+      const [data, summaryData, historyData] = await Promise.all([response.json(), summaryResponse.json(), historyResponse.json()])
       if (!response.ok || !data.success) throw new Error('status_failed')
       setStatuses(data.data || [])
-      const summaryResponse = await fetch(`${apiUrl}/api/model-status/embed/probe/summary`)
-      const summaryData = await summaryResponse.json()
       if (summaryData.success) setProbeSummary(parseActiveProbeSummary(summaryData.data))
+      if (historyData.success) setProbeHistory(parseActiveProbeResults(historyData.data))
     } catch { showToast('error', '模型状态读取失败') }
     finally { setLoading(false) }
   }, [apiUrl, headers, selectedModels, showToast, windowValue])
@@ -99,9 +103,14 @@ export function ModelStatusMonitor() {
   }, [loadStatuses, refreshInterval])
 
   const probeByModel = useMemo(() => new Map(probeSummary.results.map((item) => [item.model, item])), [probeSummary.results])
+  const probeHistoryByModel = useMemo(() => {
+    const history = new Map<string, ActiveProbeResult[]>()
+    probeHistory.forEach((item) => history.set(item.model, [...(history.get(item.model) || []), item]))
+    return history
+  }, [probeHistory])
   const tokenOwnersByModel = useMemo(() => {
     const owners = new Map<string, Array<{ id: string; label: string }>>()
-    probeConfig.tokens.forEach((item) => (item.models || []).forEach((model) => owners.set(model, [...(owners.get(model) || []), { id: item.id, label: item.label }])))
+    probeConfig.tokens.forEach((item) => (item.probe_models || []).forEach((model) => owners.set(model, [...(owners.get(model) || []), { id: item.id, label: item.label }])))
     return owners
   }, [probeConfig.tokens])
   const displayModels = useMemo<DisplayModel[]>(() => {
@@ -124,6 +133,7 @@ export function ModelStatusMonitor() {
   }, [availableModels, probeConfig.models, probeConfig.tokens, probeSummary.results, selectedModels])
   const filteredModels = useMemo(() => displayModels.filter((item) => item.model_name.toLowerCase().includes(search.toLowerCase())), [displayModels, search])
   const overall = useMemo(() => statuses.reduce((acc, item) => ({ total: acc.total + item.total, ok: acc.ok + item.ok }), { total: 0, ok: 0 }), [statuses])
+  const probeOverallState = useMemo(() => probeSummary.results.reduce<HealthState>((state, item) => worstHealth(state, probeHealth(item)), 'empty'), [probeSummary.results])
 
   const toggleModel = (model: string) => setSelectedModels((current) => current.includes(model) ? current.filter((item) => item !== model) : [...current, model])
 
@@ -263,12 +273,14 @@ export function ModelStatusMonitor() {
       const response = await apiFetch(`${apiUrl}/api/model-status/probe/run`, { method: 'POST', headers })
       const data = await response.json()
       if (!response.ok || !data.success) throw new Error(data.error?.message || 'probe_failed')
-      const [summaryResponse, configResponse] = await Promise.all([
+      const [summaryResponse, historyResponse, configResponse] = await Promise.all([
         fetch(`${apiUrl}/api/model-status/embed/probe/summary`),
+        fetch(`${apiUrl}/api/model-status/embed/probe/history?limit=200`),
         apiFetch(`${apiUrl}/api/model-status/probe/config`, { headers }),
       ])
-      const [summaryData, configData] = await Promise.all([summaryResponse.json(), configResponse.json()])
+      const [summaryData, historyData, configData] = await Promise.all([summaryResponse.json(), historyResponse.json(), configResponse.json()])
       setProbeSummary(parseActiveProbeSummary(summaryData.data))
+      if (historyData.success) setProbeHistory(parseActiveProbeResults(historyData.data))
       if (configData.success) {
         setProbeConfig(configData.data)
         setTokenLabels(Object.fromEntries(configData.data.tokens.map((item: { id: string; label: string }) => [item.id, item.label])))
@@ -290,7 +302,7 @@ export function ModelStatusMonitor() {
     <div className="mb-5 grid gap-3 sm:grid-cols-3">
       <div className="surface p-4"><div className="text-xs text-muted-foreground">流量请求</div><div className="mt-2 text-2xl font-semibold tabular-nums">{overall.total.toLocaleString()}</div><div className="mt-1 text-xs text-muted-foreground">成功率 {formatRate(overall.ok, overall.total)}</div></div>
       <div className="surface p-4"><div className="text-xs text-muted-foreground">流量健康度</div><div className="mt-2"><StateBadge state={deriveHealth(overall.ok, overall.total)} /></div><div className="mt-2 text-xs text-muted-foreground">按当前 {windowValue} 窗口计算</div></div>
-      <div className="surface p-4"><div className="text-xs text-muted-foreground">主动探测</div><div className="mt-2 flex items-center gap-2"><StateBadge state={probeSummary.results.length ? (probeSummary.results.every((item) => probeHealth(item) === 'healthy') ? 'healthy' : 'degraded') : 'empty'} label={probeSummary.enabled ? '已启用' : '未启用'} /></div><div className="mt-2 text-xs text-muted-foreground">{formatRelativeTime(probeSummary.last_run_at)}</div></div>
+      <div className="surface p-4"><div className="text-xs text-muted-foreground">主动探测</div><div className="mt-2 flex items-center gap-2"><StateBadge state={probeOverallState} label={probeSummary.enabled ? healthLabels[probeOverallState] : '未启用'} /></div><div className="mt-2 text-xs text-muted-foreground">{formatRelativeTime(probeSummary.last_run_at)}</div></div>
     </div>
 
     <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
@@ -313,8 +325,8 @@ export function ModelStatusMonitor() {
     </section>}
 
     {view === 'traffic' ? <section className="surface overflow-hidden">
-      <div className="surface-header"><div><h3 className="surface-title">用户流量健康度</h3><p className="mt-0.5 text-xs text-muted-foreground">状态与颜色由前端根据原始计数推导</p></div><Activity className="h-4 w-4 text-muted-foreground" /></div>
-      {loading ? <div className="flex h-64 items-center justify-center text-sm text-muted-foreground"><Loader2 className="mr-2 h-4 w-4 animate-spin" />读取状态</div> : statuses.length ? <div className="divide-y divide-border">{statuses.map((status) => { const state = deriveHealth(status.ok, status.total); const probe = probeByModel.get(status.model); return <div key={status.model} className="p-4"><div className="mb-3 flex flex-wrap items-center gap-2"><span className="min-w-0 flex-1 truncate text-sm font-medium" title={status.model}>{status.model}</span><StateBadge state={state} /><span className="text-xs tabular-nums text-muted-foreground">{formatRate(status.ok, status.total)} · {status.total.toLocaleString()} 请求</span>{probe && <span className="text-xs text-muted-foreground">探测 {probe.chat_ok ? `${probe.latency_ms} ms` : '异常'}</span>}</div><div className="flex h-6 gap-0.5">{status.slots.map((slot) => <div key={slot.t} className={cn('min-w-0 flex-1 rounded-sm', healthClasses[deriveHealth(slot.ok, slot.n)])} title={`${new Date(slot.t * 1000).toLocaleString()} · ${slot.ok}/${slot.n}`} />)}</div><div className="mt-2 flex justify-between text-[11px] text-muted-foreground"><span>{windowValue} 前</span><span>现在</span></div></div> })}</div> : <div className="flex h-64 flex-col items-center justify-center text-sm text-muted-foreground"><Activity className="mb-2 h-7 w-7 opacity-40" />请先在展示设置中选择模型</div>}
+      <div className="surface-header"><div><h3 className="surface-title">服务健康度</h3><p className="mt-0.5 text-xs text-muted-foreground">时间格合并用户流量与主动探测，采用较差状态</p></div><Activity className="h-4 w-4 text-muted-foreground" /></div>
+      {loading ? <div className="flex h-64 items-center justify-center text-sm text-muted-foreground"><Loader2 className="mr-2 h-4 w-4 animate-spin" />读取状态</div> : statuses.length ? <div className="divide-y divide-border">{statuses.map((status) => { const state = deriveHealth(status.ok, status.total); const probe = probeByModel.get(status.model); const activeState = probeHealth(probe); const modelProbeHistory = probeHistoryByModel.get(status.model) || []; return <div key={status.model} className="p-4"><div className="mb-3 flex flex-wrap items-center gap-2"><span className="min-w-0 flex-1 truncate text-sm font-medium" title={status.model}>{status.model}</span><StateBadge state={state} label={`流量 ${healthLabels[state]}`} /><span className="text-xs tabular-nums text-muted-foreground">{formatRate(status.ok, status.total)} · {status.total.toLocaleString()} 请求</span>{probe && <StateBadge state={activeState} label={`探测 ${healthLabels[activeState]}`} />}</div><div className="flex h-6 gap-0.5">{status.slots.map((slot) => { const slotProbeState = deriveProbeSlotHealth(slot.t, status.step, modelProbeHistory); const slotState = worstHealth(deriveHealth(slot.ok, slot.n), slotProbeState); return <div key={slot.t} className={cn('min-w-0 flex-1 rounded-sm', healthClasses[slotState])} title={`${new Date(slot.t * 1000).toLocaleString()} · 流量 ${slot.ok}/${slot.n}${slotProbeState !== 'empty' ? ` · 主动探测 ${healthLabels[slotProbeState]}` : ''}`} /> })}</div><div className="mt-2 flex justify-between text-[11px] text-muted-foreground"><span>{windowValue} 前</span><span>现在</span></div></div> })}</div> : <div className="flex h-64 flex-col items-center justify-center text-sm text-muted-foreground"><Activity className="mb-2 h-7 w-7 opacity-40" />请先在展示设置中选择模型</div>}
     </section> : <div className="grid gap-5 xl:grid-cols-[minmax(340px,0.8fr)_minmax(0,1.2fr)]">
       <section className="surface">
         <div className="surface-header"><div><h3 className="surface-title">探测配置</h3><p className="mt-0.5 text-xs text-muted-foreground">默认关闭，使用独立测试令牌</p></div><KeyRound className="h-4 w-4 text-muted-foreground" /></div>
@@ -329,7 +341,7 @@ export function ModelStatusMonitor() {
                 const models = item.models || []
                 const selectedProbeModels = item.probe_models || []
                 const expanded = expandedTokenIds.includes(item.id)
-                const duplicateCount = models.filter((model) => (tokenOwnersByModel.get(model)?.length || 0) > 1).length
+                const duplicateCount = selectedProbeModels.filter((model) => (tokenOwnersByModel.get(model)?.length || 0) > 1).length
                 return <div key={item.id} className={cn(index > 0 && 'border-t border-border')}>
                   <div className="flex min-w-0 items-center bg-muted/20">
                     <button type="button" className="flex min-w-0 flex-1 items-center gap-2 px-3 py-2.5 text-left hover:bg-muted/60" aria-expanded={expanded} onClick={() => setExpandedTokenIds((current) => current.includes(item.id) ? current.filter((id) => id !== item.id) : [...current, item.id])}>
@@ -348,7 +360,7 @@ export function ModelStatusMonitor() {
                     </div>
                     <div className="flex flex-wrap items-center justify-between gap-2"><div><div className="text-sm font-medium">参与主动探测</div><div className="text-xs text-muted-foreground">已选择 {selectedProbeModels.length} / {models.length} 个模型</div></div><div className="flex gap-1"><button type="button" className="rounded-md px-2 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground" onClick={() => setTokenProbeModels(item.id, models)}>全选</button><button type="button" className="rounded-md px-2 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground" onClick={() => setTokenProbeModels(item.id, [])}>清空</button></div></div>
                     <div className="max-h-48 overflow-y-auto rounded-md bg-muted/35 p-2">
-                      {models.length > 0 ? <div className="grid gap-1 sm:grid-cols-2">{models.map((model) => { const owners = tokenOwnersByModel.get(model) || []; const shared = owners.length > 1; const checked = selectedProbeModels.includes(model); return <button type="button" key={model} onClick={() => setTokenProbeModels(item.id, checked ? selectedProbeModels.filter((selected) => selected !== model) : [...selectedProbeModels, model])} className={cn('flex min-w-0 items-center gap-2 rounded-md border px-2 py-1.5 text-left text-xs hover:bg-background', checked ? 'border-primary/40 bg-background' : 'border-transparent', shared && 'text-amber-900 dark:text-amber-200')} title={shared ? `同时属于：${owners.map((owner) => owner.label).join('、')}` : model}><span className={cn('flex h-4 w-4 shrink-0 items-center justify-center rounded border', checked ? 'border-primary bg-primary text-primary-foreground' : 'border-input bg-background')}>{checked && <Check className="h-3 w-3" />}</span><span className="min-w-0 flex-1 truncate">{model}</span>{shared && <span className="shrink-0 text-[10px] opacity-70">共用 {owners.length}</span>}</button> })}</div> : <div className="py-4 text-center text-xs text-muted-foreground">点击“刷新模型”读取此令牌的可用模型</div>}
+                      {models.length > 0 ? <div className="grid gap-1 sm:grid-cols-2">{models.map((model) => { const owners = tokenOwnersByModel.get(model) || []; const checked = selectedProbeModels.includes(model); const shared = checked && owners.length > 1; return <button type="button" key={model} onClick={() => setTokenProbeModels(item.id, checked ? selectedProbeModels.filter((selected) => selected !== model) : [...selectedProbeModels, model])} className={cn('flex min-w-0 items-center gap-2 rounded-md border px-2 py-1.5 text-left text-xs hover:bg-background', checked ? 'border-primary/40 bg-background' : 'border-transparent', shared && 'text-amber-900 dark:text-amber-200')} title={shared ? `同时选中：${owners.map((owner) => owner.label).join('、')}` : model}><span className={cn('flex h-4 w-4 shrink-0 items-center justify-center rounded border', checked ? 'border-primary bg-primary text-primary-foreground' : 'border-input bg-background')}>{checked && <Check className="h-3 w-3" />}</span><span className="min-w-0 flex-1 truncate">{model}</span>{shared && <span className="shrink-0 text-[10px] opacity-70">共用 {owners.length}</span>}</button> })}</div> : <div className="py-4 text-center text-xs text-muted-foreground">点击“刷新模型”读取此令牌的可用模型</div>}
                     </div>
                   </div>}
                 </div>

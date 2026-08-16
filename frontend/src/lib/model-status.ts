@@ -83,13 +83,19 @@ export function parseActiveProbeResult(raw: Record<string, unknown>): ActiveProb
   }
 }
 
+export function parseActiveProbeResults(raw: unknown): ActiveProbeResult[] {
+  return Array.isArray(raw)
+    ? raw.map((item) => parseActiveProbeResult((item || {}) as Record<string, unknown>))
+    : []
+}
+
 export function parseActiveProbeSummary(raw: Record<string, unknown> | undefined): ActiveProbeSummary {
   const results = Array.isArray(raw?.r) ? raw.r : Array.isArray(raw?.results) ? raw.results : []
   return {
     enabled: Boolean(raw?.on ?? raw?.enabled),
     running: Boolean(raw?.run ?? raw?.running),
     last_run_at: Number(raw?.t ?? raw?.last_run_at ?? 0) || undefined,
-    results: results.map((item) => parseActiveProbeResult((item || {}) as Record<string, unknown>)),
+    results: parseActiveProbeResults(results),
   }
 }
 
@@ -109,8 +115,33 @@ export function deriveHealth(ok: number, total: number): HealthState {
 export function probeHealth(result?: ActiveProbeResult): HealthState {
   if (!result) return 'empty'
   if (result.models_ok && (!result.chat_checked || result.chat_ok)) return 'healthy'
-  if (result.models_ok) return 'degraded'
   return 'down'
+}
+
+const healthPriority: Record<HealthState, number> = {
+  empty: 0,
+  healthy: 1,
+  degraded: 2,
+  down: 3,
+}
+
+export function worstHealth(...states: HealthState[]): HealthState {
+  let result: HealthState = 'empty'
+  for (const state of states) {
+    if (healthPriority[state] > healthPriority[result]) result = state
+  }
+  return result
+}
+
+export function deriveProbeSlotHealth(slotStart: number, step: number, results: ActiveProbeResult[]): HealthState {
+  const slotEnd = slotStart + step
+  let state: HealthState = 'empty'
+  for (const result of results) {
+    if (result.checked_at < slotStart || result.checked_at >= slotEnd) continue
+    state = worstHealth(state, probeHealth(result))
+    if (state === 'down') break
+  }
+  return state
 }
 
 export const healthLabels: Record<HealthState, string> = {
