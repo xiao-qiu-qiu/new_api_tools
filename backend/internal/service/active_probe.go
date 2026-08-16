@@ -41,10 +41,11 @@ type ActiveProbeConfig struct {
 }
 
 type activeProbeToken struct {
-	ID     string   `json:"id"`
-	Label  string   `json:"label"`
-	Token  string   `json:"token"`
-	Models []string `json:"models,omitempty"`
+	ID          string   `json:"id"`
+	Label       string   `json:"label"`
+	Token       string   `json:"token"`
+	Models      []string `json:"models,omitempty"`
+	ProbeModels []string `json:"probe_models,omitempty"`
 }
 
 type ActiveProbeConfigInput struct {
@@ -71,10 +72,11 @@ type ActiveProbeConfigView struct {
 }
 
 type ActiveProbeTokenView struct {
-	ID       string   `json:"id"`
-	Label    string   `json:"label"`
-	HasToken bool     `json:"has_token"`
-	Models   []string `json:"models"`
+	ID          string   `json:"id"`
+	Label       string   `json:"label"`
+	HasToken    bool     `json:"has_token"`
+	Models      []string `json:"models"`
+	ProbeModels []string `json:"probe_models"`
 }
 
 // ActiveProbeResult contains only bounded metadata. Upstream response bodies
@@ -195,7 +197,7 @@ func activeProbeConfigView(cfg ActiveProbeConfig) ActiveProbeConfigView {
 	for _, token := range cfg.Tokens {
 		tokens = append(tokens, ActiveProbeTokenView{
 			ID: token.ID, Label: token.Label, HasToken: token.Token != "",
-			Models: append([]string(nil), token.Models...),
+			Models: append([]string(nil), token.Models...), ProbeModels: append([]string(nil), token.ProbeModels...),
 		})
 	}
 	return ActiveProbeConfigView{
@@ -229,20 +231,7 @@ func normalizeActiveProbeConfig(cfg *ActiveProbeConfig) {
 		cfg.TimeoutSeconds = 120
 	}
 
-	seen := make(map[string]struct{}, len(cfg.Models))
-	models := make([]string, 0, len(cfg.Models))
-	for _, model := range cfg.Models {
-		model = strings.TrimSpace(model)
-		if model == "" {
-			continue
-		}
-		if _, exists := seen[model]; exists {
-			continue
-		}
-		seen[model] = struct{}{}
-		models = append(models, model)
-	}
-	cfg.Models = models
+	legacyModels := normalizeProbeModelNames(cfg.Models)
 
 	if strings.TrimSpace(cfg.Token) != "" {
 		cfg.Tokens = append(cfg.Tokens, activeProbeToken{ID: "legacy-1", Label: "旧版令牌", Token: strings.TrimSpace(cfg.Token)})
@@ -267,9 +256,19 @@ func normalizeActiveProbeConfig(cfg *ActiveProbeConfig) {
 		}
 		token.Label = strings.TrimSpace(token.Label)
 		token.Models = normalizeProbeModelNames(token.Models)
+		if token.ProbeModels == nil {
+			if len(legacyModels) > 0 {
+				token.ProbeModels = filterProbeModelSelection(legacyModels, token.Models)
+			} else if len(token.Models) > 0 {
+				token.ProbeModels = append([]string(nil), token.Models...)
+			}
+		} else {
+			token.ProbeModels = filterProbeModelSelection(token.ProbeModels, token.Models)
+		}
 		tokens = append(tokens, token)
 	}
 	cfg.Tokens = tokens
+	cfg.Models = configuredProbeModels(tokens)
 }
 
 func validateProbeBaseURL(raw string) error {
@@ -348,6 +347,29 @@ func normalizeProbeModelNames(models []string) []string {
 	return normalized
 }
 
+func filterProbeModelSelection(selected, available []string) []string {
+	selected = normalizeProbeModelNames(selected)
+	if len(available) == 0 {
+		return selected
+	}
+	availableSet := modelSet(available)
+	filtered := make([]string, 0, len(selected))
+	for _, model := range selected {
+		if _, ok := availableSet[model]; ok {
+			filtered = append(filtered, model)
+		}
+	}
+	return filtered
+}
+
+func configuredProbeModels(tokens []activeProbeToken) []string {
+	models := make([]string, 0)
+	for _, token := range tokens {
+		models = append(models, token.ProbeModels...)
+	}
+	return normalizeProbeModelNames(models)
+}
+
 func (s *ActiveProbeService) AddToken(raw, label string, models []string) (ActiveProbeConfigView, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -361,7 +383,7 @@ func (s *ActiveProbeService) AddToken(raw, label string, models []string) (Activ
 	}
 	cfg.Tokens = append(cfg.Tokens, activeProbeToken{
 		ID: newProbeTokenID(), Label: strings.TrimSpace(label), Token: raw,
-		Models: normalizeProbeModelNames(models),
+		Models: normalizeProbeModelNames(models), ProbeModels: normalizeProbeModelNames(models),
 	})
 	normalizeActiveProbeConfig(&cfg)
 	if err := cache.Get().Set(probeConfigKey, cfg, 0); err != nil {
@@ -370,7 +392,7 @@ func (s *ActiveProbeService) AddToken(raw, label string, models []string) (Activ
 	return activeProbeConfigView(cfg), nil
 }
 
-func (s *ActiveProbeService) UpdateTokenLabel(id, label string) (ActiveProbeConfigView, error) {
+func (s *ActiveProbeService) UpdateToken(id, label string, probeModels []string) (ActiveProbeConfigView, error) {
 	id = strings.TrimSpace(id)
 	label = strings.TrimSpace(label)
 	if label == "" {
@@ -381,6 +403,7 @@ func (s *ActiveProbeService) UpdateTokenLabel(id, label string) (ActiveProbeConf
 	for index := range cfg.Tokens {
 		if cfg.Tokens[index].ID == id {
 			cfg.Tokens[index].Label = label
+			cfg.Tokens[index].ProbeModels = filterProbeModelSelection(probeModels, cfg.Tokens[index].Models)
 			found = true
 			break
 		}
@@ -388,6 +411,7 @@ func (s *ActiveProbeService) UpdateTokenLabel(id, label string) (ActiveProbeConf
 	if !found {
 		return ActiveProbeConfigView{}, errors.New("测试令牌不存在")
 	}
+	cfg.Models = configuredProbeModels(cfg.Tokens)
 	if err := cache.Get().Set(probeConfigKey, cfg, 0); err != nil {
 		return ActiveProbeConfigView{}, err
 	}
@@ -409,6 +433,7 @@ func (s *ActiveProbeService) DeleteToken(id string) (ActiveProbeConfigView, erro
 		return ActiveProbeConfigView{}, errors.New("测试令牌不存在")
 	}
 	cfg.Tokens = filtered
+	cfg.Models = configuredProbeModels(cfg.Tokens)
 	if err := cache.Get().Set(probeConfigKey, cfg, 0); err != nil {
 		return ActiveProbeConfigView{}, err
 	}
@@ -447,12 +472,19 @@ func (s *ActiveProbeService) FetchModelsByTokenID(ctx context.Context, baseURL, 
 	cfg := s.GetConfig()
 	for index := range cfg.Tokens {
 		if cfg.Tokens[index].ID == tokenID {
+			wasUnconfigured := cfg.Tokens[index].ProbeModels == nil
 			models, err := s.FetchModels(ctx, baseURL, cfg.Tokens[index].Token)
 			if err != nil {
 				return nil, err
 			}
 			models = normalizeProbeModelNames(models)
 			cfg.Tokens[index].Models = models
+			if wasUnconfigured {
+				cfg.Tokens[index].ProbeModels = append([]string(nil), models...)
+			} else {
+				cfg.Tokens[index].ProbeModels = filterProbeModelSelection(cfg.Tokens[index].ProbeModels, models)
+			}
+			cfg.Models = configuredProbeModels(cfg.Tokens)
 			if err := cache.Get().Set(probeConfigKey, cfg, 0); err != nil {
 				return nil, err
 			}
@@ -488,10 +520,6 @@ func (s *ActiveProbeService) RunNow(ctx context.Context) ([]ActiveProbeResult, e
 	if cfg.BaseURL == "" || len(cfg.Tokens) == 0 {
 		return nil, errors.New("主动探测地址或测试令牌未配置")
 	}
-	if len(cfg.Models) == 0 {
-		return nil, errors.New("主动探测模型未配置")
-	}
-
 	client := &http.Client{Timeout: time.Duration(cfg.TimeoutSeconds) * time.Second}
 	tokenStates := make([]probeTokenState, 0, len(cfg.Tokens))
 	modelsChanged := false
@@ -500,18 +528,29 @@ func (s *ActiveProbeService) RunNow(ctx context.Context) ([]ActiveProbeResult, e
 		if modelsOK {
 			available = normalizeProbeModelNames(available)
 			cfg.Tokens[index].Models = available
+			if token.ProbeModels == nil {
+				cfg.Tokens[index].ProbeModels = append([]string(nil), available...)
+			} else {
+				cfg.Tokens[index].ProbeModels = filterProbeModelSelection(token.ProbeModels, available)
+			}
 			token.Models = available
+			token.ProbeModels = cfg.Tokens[index].ProbeModels
 			modelsChanged = true
 		}
 		tokenStates = append(tokenStates, probeTokenState{
 			token: token, modelsOK: modelsOK, status: modelsStatus, errorCode: modelsError,
-			models: modelSet(available),
+			models: modelSet(available), selected: modelSet(token.ProbeModels), restrictSelection: token.ProbeModels != nil,
 		})
 	}
+	probeModels := configuredProbeModels(cfg.Tokens)
+	cfg.Models = probeModels
 	if modelsChanged {
 		if err := cache.Get().Set(probeConfigKey, cfg, 0); err != nil {
 			return nil, err
 		}
+	}
+	if len(probeModels) == 0 {
+		return nil, errors.New("请先在测试令牌中选择探测模型")
 	}
 	anyModelsOK := false
 	for _, state := range tokenStates {
@@ -520,10 +559,10 @@ func (s *ActiveProbeService) RunNow(ctx context.Context) ([]ActiveProbeResult, e
 			break
 		}
 	}
-	results := make([]ActiveProbeResult, len(cfg.Models))
+	results := make([]ActiveProbeResult, len(probeModels))
 	if !anyModelsOK {
 		now := time.Now().Unix()
-		for i, model := range cfg.Models {
+		for i, model := range probeModels {
 			results[i] = ActiveProbeResult{
 				Model:       model,
 				CheckedAt:   now,
@@ -541,7 +580,7 @@ func (s *ActiveProbeService) RunNow(ctx context.Context) ([]ActiveProbeResult, e
 
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, probeConcurrency)
-	for i, model := range cfg.Models {
+	for i, model := range probeModels {
 		wg.Add(1)
 		go func(index int, modelName string) {
 			defer wg.Done()
@@ -592,11 +631,13 @@ func (s *ActiveProbeService) RunNow(ctx context.Context) ([]ActiveProbeResult, e
 }
 
 type probeTokenState struct {
-	token     activeProbeToken
-	modelsOK  bool
-	status    int
-	errorCode string
-	models    map[string]struct{}
+	token             activeProbeToken
+	modelsOK          bool
+	status            int
+	errorCode         string
+	models            map[string]struct{}
+	selected          map[string]struct{}
+	restrictSelection bool
 }
 
 func modelSet(models []string) map[string]struct{} {
@@ -614,6 +655,11 @@ func candidateTokenStates(states []probeTokenState, model string) []probeTokenSt
 	for _, state := range states {
 		if !state.modelsOK {
 			continue
+		}
+		if state.restrictSelection {
+			if _, selected := state.selected[model]; !selected {
+				continue
+			}
 		}
 		if _, ok := state.models[model]; ok {
 			withModel = append(withModel, state)

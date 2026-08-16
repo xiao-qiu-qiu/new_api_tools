@@ -503,13 +503,14 @@ func AddActiveProbeToken(c *gin.Context) {
 
 func UpdateActiveProbeToken(c *gin.Context) {
 	var req struct {
-		Label string `json:"label"`
+		Label       string   `json:"label"`
+		ProbeModels []string `json:"probe_models"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "令牌备注格式不正确", ""))
 		return
 	}
-	data, err := service.NewActiveProbeService().UpdateTokenLabel(c.Param("id"), req.Label)
+	data, err := service.NewActiveProbeService().UpdateToken(c.Param("id"), req.Label, req.ProbeModels)
 	if err != nil {
 		status := http.StatusBadRequest
 		if err.Error() == "测试令牌不存在" {

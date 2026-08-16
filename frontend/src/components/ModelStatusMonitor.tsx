@@ -3,7 +3,7 @@ import { Activity, Check, ChevronDown, ExternalLink, KeyRound, Loader2, Play, Re
 import { useAuth } from '../contexts/AuthContext'
 import { apiFetch, createAuthHeaders } from '../lib/api'
 import {
-  type ActiveProbeConfig, type ActiveProbeSummary, type AvailableModel, type HealthState, type ModelStatusSnapshot,
+  type ActiveProbeConfig, type ActiveProbeSummary, type ActiveProbeToken, type AvailableModel, type HealthState, type ModelStatusSnapshot,
   deriveHealth, formatRate, formatRelativeTime, healthClasses, healthLabels, parseActiveProbeSummary, probeHealth,
 } from '../lib/model-status'
 import { cn } from '../lib/utils'
@@ -14,6 +14,10 @@ type DisplayModel = AvailableModel & { hasTraffic: boolean; hasProbe: boolean }
 const windowOptions = [{ value: '1h', label: '1 小时' }, { value: '6h', label: '6 小时' }, { value: '12h', label: '12 小时' }, { value: '24h', label: '24 小时' }]
 const emptyProbeConfig: ActiveProbeConfig = { enabled: false, base_url: '', models: [], interval_seconds: 300, timeout_seconds: 20, probe_mode: 'chat', tokens: [], token_count: 0, has_token: false }
 const themeOptions = [{ value: 'system', label: '跟随系统' }, { value: 'light', label: '新版浅色' }, { value: 'dark', label: '新版深色' }, { value: 'daylight', label: '白昼' }, { value: 'obsidian', label: '黑曜石' }] as const
+
+function configuredTokenModels(tokens: ActiveProbeToken[]) {
+  return Array.from(new Set(tokens.flatMap((item) => item.probe_models || []))).sort()
+}
 
 function StateBadge(props: { state: HealthState; label?: string }) {
   return <span className={cn('status-pill', props.state === 'healthy' && 'border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-300', props.state === 'degraded' && 'border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-300', props.state === 'down' && 'border-rose-200 bg-rose-50 text-rose-700 dark:border-rose-900 dark:bg-rose-950/40 dark:text-rose-300', props.state === 'empty' && 'border-border bg-muted text-muted-foreground')}><span className={cn('h-1.5 w-1.5 rounded-full', healthClasses[props.state])} />{props.label || healthLabels[props.state]}</span>
@@ -40,7 +44,7 @@ export function ModelStatusMonitor() {
   const [expandedTokenIds, setExpandedTokenIds] = useState<string[]>([])
   const [tokenLabels, setTokenLabels] = useState<Record<string, string>>({})
   const [savingTokenId, setSavingTokenId] = useState('')
-  const [probeModelsText, setProbeModelsText] = useState('')
+  const [dirtyTokenIds, setDirtyTokenIds] = useState<string[]>([])
   const [probeSummary, setProbeSummary] = useState<ActiveProbeSummary>({ enabled: false, running: false, results: [] })
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
@@ -66,7 +70,7 @@ export function ModelStatusMonitor() {
       setRefreshInterval(Number(configData.refresh_interval ?? 60))
       setProbeConfig(nextProbe)
       setTokenLabels(Object.fromEntries((nextProbe.tokens || []).map((item: { id: string; label: string }) => [item.id, item.label])))
-      setProbeModelsText((nextProbe.models || []).join('\n'))
+      setDirtyTokenIds([])
       setProbeSummary(parseActiveProbeSummary(summaryData.data))
     } catch { showToast('error', '模型监控配置加载失败') }
   }, [apiUrl, headers, showToast])
@@ -115,10 +119,9 @@ export function ModelStatusMonitor() {
     probeConfig.models.forEach((model) => add(model, 0, 'probe'))
     probeConfig.tokens.forEach((item) => (item.models || []).forEach((model) => add(model, 0, 'probe')))
     probeSummary.results.forEach((item) => add(item.model, 0, 'probe'))
-    probeModelsText.split(/[\n,]/).forEach((model) => add(model, 0, 'probe'))
     selectedModels.forEach((model) => add(model, 0, 'selected'))
     return [...catalog.values()].sort((left, right) => right.request_count_24h - left.request_count_24h || left.model_name.localeCompare(right.model_name))
-  }, [availableModels, probeConfig.models, probeConfig.tokens, probeModelsText, probeSummary.results, selectedModels])
+  }, [availableModels, probeConfig.models, probeConfig.tokens, probeSummary.results, selectedModels])
   const filteredModels = useMemo(() => displayModels.filter((item) => item.model_name.toLowerCase().includes(search.toLowerCase())), [displayModels, search])
   const overall = useMemo(() => statuses.reduce((acc, item) => ({ total: acc.total + item.total, ok: acc.ok + item.ok }), { total: 0, ok: 0 }), [statuses])
 
@@ -142,13 +145,17 @@ export function ModelStatusMonitor() {
   }
 
   const updateProbe = <K extends keyof ActiveProbeConfig>(key: K, value: ActiveProbeConfig[K]) => setProbeConfig((current) => ({ ...current, [key]: value }))
+  const markTokenDirty = (id: string) => setDirtyTokenIds((current) => current.includes(id) ? current : [...current, id])
+  const setTokenProbeModels = (id: string, models: string[]) => {
+    setProbeConfig((current) => ({ ...current, tokens: current.tokens.map((item) => item.id === id ? { ...item, probe_models: Array.from(new Set(models)).sort() } : item) }))
+    markTokenDirty(id)
+  }
   const saveProbeConfig = async () => {
     setSaving(true)
-    const models = probeModelsText.split(/[\n,]/).map((item) => item.trim()).filter(Boolean)
     try {
       const response = await apiFetch(`${apiUrl}/api/model-status/probe/config`, {
         method: 'PUT', headers, body: JSON.stringify({
-          enabled: probeConfig.enabled, base_url: probeConfig.base_url, models,
+          enabled: probeConfig.enabled, base_url: probeConfig.base_url, models: probeConfig.models,
           interval_seconds: probeConfig.interval_seconds, timeout_seconds: probeConfig.timeout_seconds,
           probe_mode: probeConfig.probe_mode,
         }),
@@ -157,7 +164,6 @@ export function ModelStatusMonitor() {
       if (!response.ok || !data.success) throw new Error(data.error?.message || 'save_failed')
       setProbeConfig(data.data)
       setTokenLabels(Object.fromEntries(data.data.tokens.map((item: { id: string; label: string }) => [item.id, item.label])))
-      setProbeModelsText(data.data.models.join('\n'))
       setProbeToken('')
       setProbeSummary((current) => ({ ...current, enabled: data.data.enabled }))
       showToast('success', '主动探测配置已保存')
@@ -174,7 +180,6 @@ export function ModelStatusMonitor() {
       if (!response.ok || !data.success) throw new Error(data.error?.message || '读取模型列表失败')
       const models = Array.isArray(data.data) ? data.data.map(String) : []
       setProbeTokenModels(models)
-      setProbeModelsText((current) => Array.from(new Set([...current.split(/[\n,]/).map((item) => item.trim()).filter(Boolean), ...models])).join('\n'))
       showToast('success', `已读取 ${models.length} 个模型，可直接添加令牌`)
     } catch (error) { showToast('error', error instanceof Error ? error.message : '读取模型列表失败') }
     finally { setFetchingProbeModels(false) }
@@ -187,9 +192,15 @@ export function ModelStatusMonitor() {
       const data = await response.json()
       if (!response.ok || !data.success) throw new Error(data.error?.message || '读取模型列表失败')
       const models = Array.isArray(data.data) ? data.data.map(String) : []
-      setProbeConfig((current) => ({ ...current, tokens: current.tokens.map((item) => item.id === id ? { ...item, models } : item) }))
-      setProbeModelsText((current) => Array.from(new Set([...current.split(/[\n,]/).map((item) => item.trim()).filter(Boolean), ...models])).join('\n'))
-      showToast('success', `已读取 ${models.length} 个模型并合并到探测列表`)
+      setProbeConfig((current) => {
+        const tokens = current.tokens.map((item) => {
+          if (item.id !== id) return item
+          const selected = item.probe_models == null ? models : item.probe_models.filter((model) => models.includes(model))
+          return { ...item, models, probe_models: selected }
+        })
+        return { ...current, tokens, models: configuredTokenModels(tokens) }
+      })
+      showToast('success', `已刷新 ${models.length} 个可用模型`)
     } catch (error) { showToast('error', error instanceof Error ? error.message : '读取模型列表失败') }
     finally { setFetchingStoredTokenId('') }
   }
@@ -204,6 +215,7 @@ export function ModelStatusMonitor() {
       setProbeConfig(data.data)
       setTokenLabels(Object.fromEntries(data.data.tokens.map((item: { id: string; label: string }) => [item.id, item.label])))
       const added = data.data.tokens.find((item: { id: string }) => !probeConfig.tokens.some((current) => current.id === item.id))
+      if (added) setDirtyTokenIds((current) => current.filter((id) => id !== added.id))
       if (added) setExpandedTokenIds((current) => [...current, added.id])
       setProbeToken('')
       setProbeTokenLabel('')
@@ -213,18 +225,21 @@ export function ModelStatusMonitor() {
     finally { setSaving(false) }
   }
 
-  const updateProbeTokenLabel = async (id: string) => {
+  const saveProbeToken = async (id: string) => {
     const label = (tokenLabels[id] || '').trim()
     if (!label) { showToast('error', '令牌备注不能为空'); return }
+    const item = probeConfig.tokens.find((tokenItem) => tokenItem.id === id)
+    if (!item) return
     setSavingTokenId(id)
     try {
-      const response = await apiFetch(`${apiUrl}/api/model-status/probe/tokens/${encodeURIComponent(id)}`, { method: 'PATCH', headers, body: JSON.stringify({ label }) })
+      const response = await apiFetch(`${apiUrl}/api/model-status/probe/tokens/${encodeURIComponent(id)}`, { method: 'PATCH', headers, body: JSON.stringify({ label, probe_models: item.probe_models || [] }) })
       const data = await response.json()
       if (!response.ok || !data.success) throw new Error(data.error?.message || '更新备注失败')
       setProbeConfig(data.data)
       setTokenLabels(Object.fromEntries(data.data.tokens.map((item: { id: string; label: string }) => [item.id, item.label])))
-      showToast('success', '令牌备注已更新')
-    } catch (error) { showToast('error', error instanceof Error ? error.message : '更新备注失败') }
+      setDirtyTokenIds((current) => current.filter((tokenId) => tokenId !== id))
+      showToast('success', '令牌配置已更新')
+    } catch (error) { showToast('error', error instanceof Error ? error.message : '更新令牌配置失败') }
     finally { setSavingTokenId('') }
   }
 
@@ -236,11 +251,13 @@ export function ModelStatusMonitor() {
       setProbeConfig(data.data)
       setExpandedTokenIds((current) => current.filter((item) => item !== id))
       setTokenLabels((current) => { const next = { ...current }; delete next[id]; return next })
+      setDirtyTokenIds((current) => current.filter((item) => item !== id))
       showToast('success', '测试令牌已删除')
     } catch (error) { showToast('error', error instanceof Error ? error.message : '删除令牌失败') }
   }
 
   const runProbe = async () => {
+    if (dirtyTokenIds.length > 0) { showToast('error', '请先保存令牌内的模型选择'); return }
     setRunning(true)
     try {
       const response = await apiFetch(`${apiUrl}/api/model-status/probe/run`, { method: 'POST', headers })
@@ -306,17 +323,18 @@ export function ModelStatusMonitor() {
           <div><label className="field-label">NewAPI 地址</label><input className="field" value={probeConfig.base_url} onChange={(event) => updateProbe('base_url', event.target.value)} placeholder="http://new-api:3000" /></div>
           <div><label className="field-label">探测方式</label><select className="field" value={probeConfig.probe_mode} onChange={(event) => updateProbe('probe_mode', event.target.value as ActiveProbeConfig['probe_mode'])}><option value="chat">模型列表 + 最小聊天校验</option><option value="models">仅模型列表（零聊天 token）</option></select><p className="mt-1 text-xs text-muted-foreground">聊天请求设置 1 个输出 token 上限；输入、缓存和渠道注入仍按上游实际统计。</p></div>
           <div className="space-y-2">
-            <div className="flex items-end justify-between gap-3"><label className="field-label mb-0">测试令牌 · 已配置 {probeConfig.token_count}</label><span className="text-xs text-muted-foreground">展开查看模型归属</span></div>
+            <div className="flex items-end justify-between gap-3"><label className="field-label mb-0">测试令牌 · 已配置 {probeConfig.token_count}</label><span className="text-xs text-muted-foreground">展开配置探测模型</span></div>
             {probeConfig.tokens.length > 0 && <div className="overflow-hidden rounded-md border border-border">
               {probeConfig.tokens.map((item, index) => {
                 const models = item.models || []
+                const selectedProbeModels = item.probe_models || []
                 const expanded = expandedTokenIds.includes(item.id)
                 const duplicateCount = models.filter((model) => (tokenOwnersByModel.get(model)?.length || 0) > 1).length
                 return <div key={item.id} className={cn(index > 0 && 'border-t border-border')}>
                   <div className="flex min-w-0 items-center bg-muted/20">
                     <button type="button" className="flex min-w-0 flex-1 items-center gap-2 px-3 py-2.5 text-left hover:bg-muted/60" aria-expanded={expanded} onClick={() => setExpandedTokenIds((current) => current.includes(item.id) ? current.filter((id) => id !== item.id) : [...current, item.id])}>
                       <KeyRound className="h-4 w-4 shrink-0 text-muted-foreground" />
-                      <span className="min-w-0 flex-1"><span className="block truncate text-sm font-medium">{item.label || '未命名令牌'}</span><span className="block text-xs text-muted-foreground">{models.length ? `${models.length} 个模型` : '尚未读取模型'}{duplicateCount > 0 ? ` · ${duplicateCount} 个重叠` : ''}</span></span>
+                      <span className="min-w-0 flex-1"><span className="block truncate text-sm font-medium">{item.label || '未命名令牌'}</span><span className="block text-xs text-muted-foreground">{models.length ? `探测 ${selectedProbeModels.length} / ${models.length} 个模型` : '尚未读取模型'}{duplicateCount > 0 ? ` · ${duplicateCount} 个重叠` : ''}</span></span>
                       {duplicateCount > 0 && <span className="hidden shrink-0 rounded bg-amber-100 px-1.5 py-0.5 text-[11px] text-amber-800 dark:bg-amber-950/60 dark:text-amber-300 sm:inline">存在共用模型</span>}
                       <ChevronDown className={cn('h-4 w-4 shrink-0 text-muted-foreground transition-transform', expanded && 'rotate-180')} />
                     </button>
@@ -324,12 +342,13 @@ export function ModelStatusMonitor() {
                   </div>
                   {expanded && <div className="space-y-3 border-t border-border p-3">
                     <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto_auto]">
-                      <input className="field" value={tokenLabels[item.id] ?? item.label} onChange={(event) => setTokenLabels((current) => ({ ...current, [item.id]: event.target.value }))} placeholder="令牌备注" />
-                      <button type="button" className="inline-flex h-10 items-center justify-center gap-2 rounded-md border border-border px-3 text-sm hover:bg-muted disabled:pointer-events-none disabled:opacity-50" onClick={() => void updateProbeTokenLabel(item.id)} disabled={savingTokenId === item.id || !(tokenLabels[item.id] || '').trim() || (tokenLabels[item.id] || '').trim() === item.label}>{savingTokenId === item.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}保存备注</button>
+                      <input className="field" value={tokenLabels[item.id] ?? item.label} onChange={(event) => { setTokenLabels((current) => ({ ...current, [item.id]: event.target.value })); markTokenDirty(item.id) }} placeholder="令牌备注" />
+                      <button type="button" className="inline-flex h-10 items-center justify-center gap-2 rounded-md border border-border px-3 text-sm hover:bg-muted disabled:pointer-events-none disabled:opacity-50" onClick={() => void saveProbeToken(item.id)} disabled={savingTokenId === item.id || !(tokenLabels[item.id] || '').trim() || !dirtyTokenIds.includes(item.id)}>{savingTokenId === item.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}保存配置</button>
                       <button type="button" className="inline-flex h-10 items-center justify-center gap-2 rounded-md border border-border px-3 text-sm hover:bg-muted disabled:pointer-events-none disabled:opacity-50" onClick={() => void fetchStoredTokenModels(item.id)} disabled={Boolean(fetchingStoredTokenId) || saving} title="重新读取此令牌支持的模型">{fetchingStoredTokenId === item.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}刷新模型</button>
                     </div>
+                    <div className="flex flex-wrap items-center justify-between gap-2"><div><div className="text-sm font-medium">参与主动探测</div><div className="text-xs text-muted-foreground">已选择 {selectedProbeModels.length} / {models.length} 个模型</div></div><div className="flex gap-1"><button type="button" className="rounded-md px-2 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground" onClick={() => setTokenProbeModels(item.id, models)}>全选</button><button type="button" className="rounded-md px-2 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground" onClick={() => setTokenProbeModels(item.id, [])}>清空</button></div></div>
                     <div className="max-h-48 overflow-y-auto rounded-md bg-muted/35 p-2">
-                      {models.length > 0 ? <div className="flex flex-wrap gap-1.5">{models.map((model) => { const owners = tokenOwnersByModel.get(model) || []; const shared = owners.length > 1; return <span key={model} className={cn('inline-flex max-w-full items-center gap-1 rounded border px-2 py-1 text-xs', shared ? 'border-amber-200 bg-amber-50 text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200' : 'border-border bg-background')} title={shared ? `同时属于：${owners.map((owner) => owner.label).join('、')}` : model}><span className="truncate">{model}</span>{shared && <span className="shrink-0 text-[10px] opacity-70">共用 {owners.length}</span>}</span> })}</div> : <div className="py-4 text-center text-xs text-muted-foreground">点击“刷新模型”读取此令牌的可用模型</div>}
+                      {models.length > 0 ? <div className="grid gap-1 sm:grid-cols-2">{models.map((model) => { const owners = tokenOwnersByModel.get(model) || []; const shared = owners.length > 1; const checked = selectedProbeModels.includes(model); return <button type="button" key={model} onClick={() => setTokenProbeModels(item.id, checked ? selectedProbeModels.filter((selected) => selected !== model) : [...selectedProbeModels, model])} className={cn('flex min-w-0 items-center gap-2 rounded-md border px-2 py-1.5 text-left text-xs hover:bg-background', checked ? 'border-primary/40 bg-background' : 'border-transparent', shared && 'text-amber-900 dark:text-amber-200')} title={shared ? `同时属于：${owners.map((owner) => owner.label).join('、')}` : model}><span className={cn('flex h-4 w-4 shrink-0 items-center justify-center rounded border', checked ? 'border-primary bg-primary text-primary-foreground' : 'border-input bg-background')}>{checked && <Check className="h-3 w-3" />}</span><span className="min-w-0 flex-1 truncate">{model}</span>{shared && <span className="shrink-0 text-[10px] opacity-70">共用 {owners.length}</span>}</button> })}</div> : <div className="py-4 text-center text-xs text-muted-foreground">点击“刷新模型”读取此令牌的可用模型</div>}
                     </div>
                   </div>}
                 </div>
@@ -338,7 +357,6 @@ export function ModelStatusMonitor() {
             <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_160px]"><input className="field" type="password" value={probeToken} onChange={(event) => { setProbeToken(event.target.value); setProbeTokenModels([]) }} placeholder="粘贴新的测试令牌" autoComplete="new-password" /><input className="field" value={probeTokenLabel} onChange={(event) => setProbeTokenLabel(event.target.value)} placeholder="备注（可选）" /></div>
             <div className="flex flex-wrap gap-2"><button type="button" className="inline-flex h-9 items-center gap-2 rounded-md border border-border px-3 text-sm hover:bg-muted" onClick={() => void fetchProbeModels()} disabled={fetchingProbeModels || saving || !probeToken.trim()}>{fetchingProbeModels ? <Loader2 className="h-4 w-4 animate-spin" /> : <Search className="h-4 w-4" />}添加前读取</button><button type="button" className="inline-flex h-9 items-center gap-2 rounded-md bg-primary px-3 text-sm font-medium text-primary-foreground" onClick={() => void addProbeToken()} disabled={saving || fetchingProbeModels || !probeToken.trim()}><KeyRound className="h-4 w-4" />添加令牌</button>{probeTokenModels.length > 0 && <span className="self-center text-xs text-emerald-600">已读取 {probeTokenModels.length} 个模型，将随令牌保存</span>}</div>
           </div>
-          <div><label className="field-label">探测模型</label><textarea className="min-h-28 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" value={probeModelsText} onChange={(event) => setProbeModelsText(event.target.value)} placeholder={'每行一个模型\ngpt-4o-mini'} /></div>
           <div className="grid grid-cols-2 gap-3"><div><label className="field-label">间隔（秒）</label><input className="field" type="number" min={30} max={86400} value={probeConfig.interval_seconds} onChange={(event) => updateProbe('interval_seconds', Number(event.target.value))} /></div><div><label className="field-label">超时（秒）</label><input className="field" type="number" min={3} max={120} value={probeConfig.timeout_seconds} onChange={(event) => updateProbe('timeout_seconds', Number(event.target.value))} /></div></div>
           <div className="flex gap-2"><button type="button" className="inline-flex h-9 flex-1 items-center justify-center gap-2 rounded-md border border-border text-sm hover:bg-muted" onClick={() => void runProbe()} disabled={running || saving}>{running ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}立即探测</button><button type="button" className="inline-flex h-9 flex-1 items-center justify-center gap-2 rounded-md bg-primary text-sm font-medium text-primary-foreground" onClick={() => void saveProbeConfig()} disabled={saving || running}>{saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}保存配置</button></div>
         </div>

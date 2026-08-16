@@ -54,6 +54,7 @@ export interface ActiveProbeToken {
   label: string
   has_token: boolean
   models: string[]
+  probe_models: string[]
 }
 
 export interface AvailableModel {

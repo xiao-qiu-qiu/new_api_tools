@@ -137,7 +137,7 @@ func TestActiveProbeTokenMetadataPersistsWithoutExposingSecret(t *testing.T) {
 	if err != nil {
 		t.Fatalf("add token: %v", err)
 	}
-	if len(view.Tokens) != 1 || strings.Join(view.Tokens[0].Models, ",") != "manual-a,manual-b" {
+	if len(view.Tokens) != 1 || strings.Join(view.Tokens[0].Models, ",") != "manual-a,manual-b" || strings.Join(view.Tokens[0].ProbeModels, ",") != "manual-a,manual-b" {
 		t.Fatalf("unexpected initial token metadata: %+v", view.Tokens)
 	}
 
@@ -153,8 +153,8 @@ func TestActiveProbeTokenMetadataPersistsWithoutExposingSecret(t *testing.T) {
 		t.Fatalf("fetched models were not persisted: %+v", view.Tokens[0])
 	}
 
-	view, err = svc.UpdateTokenLabel(view.Tokens[0].ID, "生产分组")
-	if err != nil || view.Tokens[0].Label != "生产分组" {
+	view, err = svc.UpdateToken(view.Tokens[0].ID, "生产分组", []string{"model-a"})
+	if err != nil || view.Tokens[0].Label != "生产分组" || strings.Join(view.Tokens[0].ProbeModels, ",") != "model-a" {
 		t.Fatalf("update token label: view=%+v err=%v", view, err)
 	}
 	encoded, _ := json.Marshal(view)
@@ -218,7 +218,11 @@ func TestActiveProbeUsesTokenModelVisibilityToAvoidDuplicateChatChecks(t *testin
 		t.Fatalf("set config: %v", err)
 	}
 	cfg := svc.GetConfig()
-	cfg.Tokens = []activeProbeToken{{ID: "a", Label: "A", Token: "token-a"}, {ID: "b", Label: "B", Token: "token-b"}}
+	cfg.Tokens = []activeProbeToken{
+		{ID: "a", Label: "A", Token: "token-a", ProbeModels: []string{"model-a"}},
+		{ID: "b", Label: "B", Token: "token-b", ProbeModels: []string{"model-b"}},
+	}
+	cfg.Models = configuredProbeModels(cfg.Tokens)
 	if err := cache.Get().Set(probeConfigKey, cfg, 0); err != nil {
 		t.Fatalf("store tokens: %v", err)
 	}
@@ -231,13 +235,10 @@ func TestActiveProbeUsesTokenModelVisibilityToAvoidDuplicateChatChecks(t *testin
 	if err != nil {
 		t.Fatalf("run probe: %v", err)
 	}
+	if len(results) != 2 {
+		t.Fatalf("expected only per-token selected models, got %+v", results)
+	}
 	for _, result := range results {
-		if result.Model == "model-c" {
-			if result.ModelsOK || result.ChatChecked || result.ChatOK || result.ErrorCode != "model_unavailable" {
-				t.Fatalf("unexpected unavailable-model result: %+v", result)
-			}
-			continue
-		}
 		if !result.ModelsOK || !result.ChatChecked || !result.ChatOK {
 			t.Fatalf("unexpected result: %+v", result)
 		}
@@ -248,7 +249,7 @@ func TestActiveProbeUsesTokenModelVisibilityToAvoidDuplicateChatChecks(t *testin
 		t.Fatalf("expected one chat request per model, got %+v", chatCalls)
 	}
 	if chatCalls["model-c"] != 0 {
-		t.Fatalf("unsupported model should not use chat tokens, got %+v", chatCalls)
+		t.Fatalf("unselected model should not use chat tokens, got %+v", chatCalls)
 	}
 }
 
